@@ -363,7 +363,6 @@ class EPGroupScheduler:
                 seq_lens,
                 t,
             )
-        print(durations)
 
         group_duration = max(durations) if durations else 0.0
         self._iteration_count += 1
@@ -619,6 +618,7 @@ def main() -> None:
             host=args.host,
             port=port,
             log_level=args.log_level,
+            access_log=False,  # Disable access log to prevent TUI flickering
             # each server runs its own asyncio loop in its own thread
             loop="asyncio",
         )

@@ -11,13 +11,14 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from rich.align import Align
+
 # Rich imports
 from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
 from rich.layout import Layout
-from rich.align import Align
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 if TYPE_CHECKING:
@@ -82,12 +83,15 @@ class PrefillDashboard:
                 datefmt="%H:%M:%S",
             )
         )
-        logger = logging.getLogger("prefill_server")
-        # Remove existing handlers to prevent console output
-        logger.handlers = []
-        logger.addHandler(self.log_handler)
-        # Prevent propagation to root logger (which may have console handler)
-        logger.propagate = False
+
+        # Intercept prefill_server and uvicorn loggers to prevent TUI flickering
+        for logger_name in ("prefill_server", "uvicorn", "uvicorn.error", "uvicorn.access"):
+            logger = logging.getLogger(logger_name)
+            # Remove existing handlers to prevent console output
+            logger.handlers = []
+            logger.addHandler(self.log_handler)
+            # Prevent propagation to root logger (which may have console handler)
+            logger.propagate = False
 
     def _make_header(self) -> Panel:
         """Create the header panel."""
