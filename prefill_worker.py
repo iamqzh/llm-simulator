@@ -488,12 +488,17 @@ class PrefillDashboard:
         self._total_iterations = 0
         self._last_iteration = 0
 
-        # Setup log handler
+        # Setup log handler - replace console output with TUI capture
         self.log_handler = TUILogHandler(max_logs=200)
         self.log_handler.setFormatter(
             logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
         )
-        logging.getLogger("prefill_server").addHandler(self.log_handler)
+        logger = logging.getLogger("prefill_server")
+        # Remove existing handlers to prevent console output
+        logger.handlers = []
+        logger.addHandler(self.log_handler)
+        # Prevent propagation to root logger (which may have console handler)
+        logger.propagate = False
 
     def _make_header(self) -> Panel:
         """Create the header panel."""
@@ -737,8 +742,10 @@ class PrefillDashboard:
             self._thread.join(timeout=2)
             self._thread = None
 
-        # Remove log handler
-        logging.getLogger("prefill_server").removeHandler(self.log_handler)
+        # Restore logging: remove TUI handler and re-enable propagation
+        logger = logging.getLogger("prefill_server")
+        logger.removeHandler(self.log_handler)
+        logger.propagate = True
 
         # Show cursor and clear
         self.console.show_cursor()
