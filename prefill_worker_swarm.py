@@ -3,27 +3,27 @@ prefill_worker_swarm.py — Multi-worker swarm manager
 
 Manages multiple prefill worker processes with a unified dashboard.
 Each worker is an independent process with its own EP-group scheduler.
+Uses multiprocessing.Manager to share state with the dashboard.
 
 Architecture
 ────────────
   ┌─ Swarm Manager (this process) ──────────────────────────────┐
   │                                                             │
-  │  ┌─ Worker 0 ──┐  ┌─ Worker 1 ──┐  ┌─ Worker N ──┐          │
-  │  │ EP-Group 0  │  │ EP-Group 1  │  │ EP-Group N  │          │
-  │  │ Ports 8100+ │  │ Ports 8200+ │  │ Ports 8300+ │          │
-  │  └─────────────┘  └─────────────┘  └─────────────┘          │
-  │                                                             │
-  │  Unified TUI Dashboard (all workers + per-worker logs)      │
+  │  ┌─ Worker 0 ──┐  ┌─ Worker 1 ──┐  ┌─ Worker N ──┐         │
+  │  │ EP-Group 0  │  │ EP-Group 1  │  │ EP-Group N  │         │
+  │  │ Ports 8100+ │  │ Ports 8200+ │  │ Ports 8300+ │         │
+  │  └─────────────┘  └─────────────┘  └─────────────┘         │
+  │         │                │                │                 │
+  │         └────────────────┴────────────────┘                 │
+  │                      │                                      │
+  │              Shared State (Manager.dict)                    │
+  │                      │                                      │
+  │         Unified TUI Dashboard (reads state)                 │
   └─────────────────────────────────────────────────────────────┘
 
 Usage
 ─────
   python prefill_worker_swarm.py --n-workers 3 --dp-per-worker 4 --base-port 8100
-
-  # 3 workers, each with 4 DP workers
-  # Worker 0: ports 8100-8103
-  # Worker 1: ports 8200-8203
-  # Worker 2: ports 8300-8303
 """
 
 from __future__ import annotations
@@ -33,9 +33,11 @@ import logging
 import multiprocessing
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from multiprocessing import Manager
+from typing import Dict, List, Optional
 
 # TUI Dashboard (optional)
 try:
@@ -67,32 +69,17 @@ class WorkerConfig:
     max_seq_len: int = 4096
 
 
-def run_worker(config: WorkerConfig) -> None:
-    """Run a single worker process."""
-    from prefill_worker import EPGroupScheduler, PrefillComputeConfig, make_app
-
+def run_worker(config: WorkerConfig, shared_state: Optional[Dict] = None) -> None:
+    """Run a single worker process with state reporting."""
     import uvicorn
 
-    # Configure logging with worker ID prefix
-    worker_logger_name = f"prefill-worker-{config.worker_id}"
-    logger = logging.getLogger(worker_logger_name)
-    logger.setLevel(logging.INFO)
-    
-    # Remove existing handlers and add our own with worker prefix
-    logger.handlers = []
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            f"%(asctime)s  %(levelname)-8s  [{worker_logger_name}] %(message)s",
-            datefmt="%H:%M:%S",
-        )
-    )
-    logger.addHandler(handler)
+    from prefill_worker import EPGroupScheduler, PrefillComputeConfig, make_app
 
     # Set process title for debugging
     try:
         import setproctitle
-        setproctitle.setproctitle(worker_logger_name)
+
+        setproctitle.setproctitle(f"prefill-worker-{config.worker_id}")
     except ImportError:
         pass
 
@@ -107,8 +94,9 @@ def run_worker(config: WorkerConfig) -> None:
     # Build one FastAPI app per DP
     apps = [make_app(dp_id=i, scheduler=scheduler) for i in range(config.n_dp)]
 
-    logger.info(
-        "Starting %d DP servers on ports %d-%d",
+    log.info(
+        "Worker %d starting %d DP servers on ports %d-%d",
+        config.worker_id,
         config.n_dp,
         config.base_port,
         config.base_port + config.n_dp - 1,
@@ -123,14 +111,12 @@ def run_worker(config: WorkerConfig) -> None:
             app,
             host=config.host,
             port=port,
-            log_level="info",
+            log_level="warning",  # Reduce uvicorn log noise
             access_log=False,
             loop="asyncio",
         )
         server = uvicorn.Server(uvicorn_config)
         servers.append(server)
-
-        import threading
 
         t = threading.Thread(
             target=server.run,
@@ -139,14 +125,53 @@ def run_worker(config: WorkerConfig) -> None:
         )
         threads.append(t)
         t.start()
-        logger.info("  DP %d → http://%s:%d", i, config.host, port)
+
+    # Status reporting thread
+    def report_status():
+        """Periodically report status to shared state."""
+        while True:
+            if shared_state is not None:
+                try:
+                    status = scheduler.get_detailed_status()
+                    dp_statuses = []
+                    for dp in status["dp_details"]:
+                        dp_statuses.append(
+                            {
+                                "worker_id": config.worker_id,
+                                "dp_id": dp["dp_id"],
+                                "port": config.base_port + dp["dp_id"],
+                                "queue_depth": dp["queue_depth"],
+                                "queue_tokens": dp["queue_tokens"],
+                                "batch_size": dp["batch_size"],
+                                "batch_tokens": dp["batch_tokens"],
+                                "compute_time": dp["compute_time"],
+                                "busy": status["busy"],
+                                "iteration": status["iteration"],
+                            }
+                        )
+
+                    worker_status = {
+                        "worker_id": config.worker_id,
+                        "base_port": config.base_port,
+                        "iteration": status["iteration"],
+                        "dp_statuses": dp_statuses,
+                        "last_update": time.time(),
+                    }
+                    shared_state[f"worker_{config.worker_id}"] = worker_status
+                except Exception as e:
+                    log.debug("Failed to report status: %s", e)
+            time.sleep(0.2)  # Update 5 times per second
+
+    # Start status reporting thread
+    status_thread = threading.Thread(target=report_status, daemon=True, name="status-reporter")
+    status_thread.start()
 
     # Keep worker alive
     try:
         for t in threads:
             t.join()
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        log.info("Worker %d shutting down...", config.worker_id)
         for s in servers:
             s.should_exit = True
 
@@ -170,6 +195,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # Create shared state manager
+    manager = Manager()
+    shared_state = manager.dict()
 
     # Build worker configurations
     worker_configs = []
@@ -199,7 +228,7 @@ def main() -> None:
     for config in worker_configs:
         p = multiprocessing.Process(
             target=run_worker,
-            args=(config,),
+            args=(config, shared_state),
             name=f"prefill-worker-{config.worker_id}",
             daemon=True,
         )
@@ -221,10 +250,14 @@ def main() -> None:
                 base_port=args.base_port,
                 port_step=args.port_step,
                 refresh_rate=args.tui_refresh,
+                shared_state=dict(shared_state),  # Convert to regular dict for access
             )
             dashboard.start()
         except Exception as e:
             log.warning("Failed to start TUI dashboard: %s", e)
+            import traceback
+
+            traceback.print_exc()
             dashboard = None
 
     # Wait for workers or interrupt
@@ -234,6 +267,7 @@ def main() -> None:
             dashboard.stop()
         for p in processes:
             p.terminate()
+        manager.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -241,6 +275,10 @@ def main() -> None:
 
     try:
         while True:
+            # Update dashboard's reference to shared state (it's a proxy)
+            if dashboard and hasattr(dashboard, "shared_state"):
+                dashboard.shared_state = dict(shared_state)
+
             # Check if any worker died
             for i, p in enumerate(processes):
                 if not p.is_alive():
@@ -253,6 +291,7 @@ def main() -> None:
         for p in processes:
             p.terminate()
             p.join(timeout=5)
+        manager.shutdown()
 
 
 if __name__ == "__main__":

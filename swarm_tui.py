@@ -1,15 +1,16 @@
 """
 Swarm TUI Dashboard — Multi-worker monitoring with per-DP detail.
 
+Uses multiprocessing.Manager to share state between workers and dashboard.
+
 Layout:
 ┌─ Header ──────────────────────────────────────────────────────────┐
 │ SWARM DASHBOARD — N Workers × M DP each                           │
 ├─ Left ────────────────────────┬─ Right ───────────────────────────┤
-│ All DP Status (All Workers)   │ Per-Worker Logs                   │
-│ W0: DP0 DP1 DP2 DP3           │ ┌─ Worker 0 Logs ─┐               │
-│ W1: DP0 DP1 DP2 DP3           │ │ ...               │               │
-│ W2: DP0 DP1 DP2 DP3           │ ├─ Worker 1 Logs ─┤               │
-│ ...                           │ │ ...               │               │
+│ All DP Status (All Workers)   │ Application Logs                   │
+│ W0: DP0 DP1 DP2 DP3           │ ┌─ Recent Logs ──┐                │
+│ W1: DP0 DP1 DP2 DP3           │ │ ...              │                │
+│ W2: DP0 DP1 DP2 DP3           │ └─────────────────┘                │
 └───────────────────────────────┴───────────────────────────────────┘
 """
 
@@ -18,8 +19,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import List, Optional, Dict
-from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, field, asdict
+from multiprocessing import Manager
 
 from rich.align import Align
 from rich.console import Console, Group
@@ -42,6 +44,14 @@ class DPStatus:
     batch_tokens: int = 0
     compute_time: float = 0.0
     busy: bool = False
+    iteration: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DPStatus":
+        return cls(**d)
 
 
 @dataclass
@@ -51,12 +61,33 @@ class WorkerStatus:
     base_port: int
     iteration: int = 0
     dp_statuses: List[DPStatus] = field(default_factory=list)
+    last_update: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "worker_id": self.worker_id,
+            "base_port": self.base_port,
+            "iteration": self.iteration,
+            "dp_statuses": [dp.to_dict() for dp in self.dp_statuses],
+            "last_update": self.last_update,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkerStatus":
+        dp_statuses = [DPStatus.from_dict(dp) for dp in d.get("dp_statuses", [])]
+        return cls(
+            worker_id=d["worker_id"],
+            base_port=d["base_port"],
+            iteration=d.get("iteration", 0),
+            dp_statuses=dp_statuses,
+            last_update=d.get("last_update", 0.0),
+        )
 
 
 class SwarmLogHandler(logging.Handler):
-    """Captures logs per worker for TUI display."""
+    """Captures logs for TUI display."""
 
-    def __init__(self, max_logs: int = 500):
+    def __init__(self, max_logs: int = 200):
         super().__init__()
         self.logs: List[str] = []
         self.max_logs = max_logs
@@ -72,24 +103,13 @@ class SwarmLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-    def get_logs(self, count: int = 100) -> List[str]:
+    def get_logs(self, count: int = 50) -> List[str]:
         with self._lock:
             return self.logs[-count:] if count < len(self.logs) else self.logs.copy()
 
-    def get_logs_for_worker(self, worker_id: int, count: int = 20) -> List[str]:
-        """Get logs filtered by worker ID."""
-        with self._lock:
-            # Filter logs containing worker ID pattern like [prefill-worker-0]
-            pattern = f"[prefill-worker-{worker_id}]"
-            worker_logs = [
-                log for log in self.logs
-                if pattern in log
-            ]
-            return worker_logs[-count:] if count < len(worker_logs) else worker_logs
-
 
 class SwarmDashboard:
-    """Multi-worker TUI dashboard showing all DPs from all workers."""
+    """Multi-worker TUI dashboard using shared state."""
 
     def __init__(
         self,
@@ -98,6 +118,7 @@ class SwarmDashboard:
         base_port: int,
         port_step: int,
         refresh_rate: float = 0.5,
+        shared_state: Optional[Dict] = None,
     ) -> None:
         self.n_workers = n_workers
         self.dp_per_worker = dp_per_worker
@@ -108,11 +129,14 @@ class SwarmDashboard:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
+        # Shared state from Manager
+        self.shared_state = shared_state
+
         # Log display config
         self._logs_per_worker = 6
 
-        # Setup log handler
-        self.log_handler = SwarmLogHandler(max_logs=1000)
+        # Setup log handler for local logs (manager + worker startup)
+        self.log_handler = SwarmLogHandler(max_logs=200)
         self.log_handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s  %(levelname)-8s  %(message)s",
@@ -120,19 +144,35 @@ class SwarmDashboard:
             )
         )
 
-        # Intercept all loggers including per-worker loggers
-        logger_names = [
-            "prefill_swarm",
-            "prefill_worker",
-            "uvicorn",
-            "uvicorn.error",
-        ] + [f"prefill-worker-{w}" for w in range(n_workers)]
-        
-        for logger_name in logger_names:
+        # Intercept local loggers
+        for logger_name in ("prefill_swarm", "uvicorn", "uvicorn.error"):
             logger = logging.getLogger(logger_name)
             logger.handlers = []
             logger.addHandler(self.log_handler)
             logger.propagate = False
+
+    def _get_worker_status(self, worker_id: int) -> WorkerStatus:
+        """Get status for a worker from shared state or create default."""
+        if self.shared_state and f"worker_{worker_id}" in self.shared_state:
+            try:
+                data = self.shared_state[f"worker_{worker_id}"]
+                return WorkerStatus.from_dict(data)
+            except (KeyError, TypeError):
+                pass
+        
+        # Return default status
+        dp_statuses = []
+        for d in range(self.dp_per_worker):
+            dp_statuses.append(DPStatus(
+                worker_id=worker_id,
+                dp_id=d,
+                port=self.base_port + worker_id * self.port_step + d,
+            ))
+        return WorkerStatus(
+            worker_id=worker_id,
+            base_port=self.base_port + worker_id * self.port_step,
+            dp_statuses=dp_statuses,
+        )
 
     def _make_header(self) -> Panel:
         """Create the swarm header panel."""
@@ -153,65 +193,12 @@ class SwarmDashboard:
             padding=(0, 1),
         )
 
-    def _parse_status_from_logs(self) -> Dict[int, WorkerStatus]:
-        """Parse worker and DP status from captured logs."""
-        # Initialize with empty statuses
-        workers = {}
-        for w in range(self.n_workers):
-            dp_statuses = []
-            for d in range(self.dp_per_worker):
-                dp_statuses.append(DPStatus(
-                    worker_id=w,
-                    dp_id=d,
-                    port=self.base_port + w * self.port_step + d,
-                ))
-            workers[w] = WorkerStatus(
-                worker_id=w,
-                base_port=self.base_port + w * self.port_step,
-                dp_statuses=dp_statuses,
-            )
-
-        # Parse logs to extract status info
-        all_logs = self.log_handler.get_logs(200)
-        for log in all_logs:
-            # Determine which worker this log belongs to
-            worker_id = None
-            for w in range(self.n_workers):
-                if f"[prefill-worker-{w}]" in log:
-                    worker_id = w
-                    break
-            
-            if worker_id is None:
-                continue
-
-            # Parse iteration info
-            if "iteration=" in log.lower():
-                try:
-                    import re
-                    match = re.search(r'iteration=(\d+)', log, re.IGNORECASE)
-                    if match:
-                        workers[worker_id].iteration = int(match.group(1))
-                except (ValueError, AttributeError):
-                    pass
-
-            # Parse DP status from ENQUEUE logs
-            if "ENQUEUE" in log and "[DP" in log:
-                try:
-                    import re
-                    dp_match = re.search(r'\[DP\s*(\d+)\]', log)
-                    if dp_match:
-                        dp_id = int(dp_match.group(1))
-                        if 0 <= dp_id < self.dp_per_worker:
-                            workers[worker_id].dp_statuses[dp_id].queue_depth += 1
-                except (ValueError, AttributeError):
-                    pass
-
-        return workers
-
-    def _make_dp_table(self) -> Panel:
-        """Create the all-DP status table (left panel)."""
+    def _make_worker_dp_table(self, worker_id: int) -> Table:
+        """Create a DP status table for a single worker."""
+        worker = self._get_worker_status(worker_id)
+        
         table = Table(
-            title="All DP Workers",
+            title=f"Worker {worker_id} (Ports {worker.base_port}-{worker.base_port + self.dp_per_worker - 1}) Iter={worker.iteration}",
             title_style="bold magenta",
             header_style="bold cyan",
             border_style="dim",
@@ -220,102 +207,83 @@ class SwarmDashboard:
             show_lines=False,
         )
 
-        # Columns: Worker | DP | Port | Queue | Batch | Compute | Status
-        table.add_column("Worker", style="bold", width=7)
-        table.add_column("DP", style="bold", width=4)
-        table.add_column("Port", justify="right", width=6)
+        # Columns: DP | Queue | Tokens | Batch | Tokens | Compute | Load
+        table.add_column("DP", style="bold", width=6)
         table.add_column("Queue", justify="right", width=6)
         table.add_column("Tokens", justify="right", width=7)
         table.add_column("Batch", justify="right", width=6)
+        table.add_column("Tokens", justify="right", width=7)
         table.add_column("Compute", justify="right", width=9)
-        table.add_column("Status", width=8)
+        table.add_column("Load", width=10)
 
-        # Parse current status from logs
-        workers = self._parse_status_from_logs()
+        for dp in worker.dp_statuses:
+            # Color code based on load
+            if dp.queue_depth == 0 and dp.batch_size == 0:
+                status_style = "dim"
+                emoji = "💤"
+            elif dp.queue_depth > 5:
+                status_style = "red"
+                emoji = "🔥"
+            elif dp.queue_depth > 0:
+                status_style = "yellow"
+                emoji = "⚡"
+            else:
+                status_style = "green"
+                emoji = "✅"
 
+            # Load bar
+            if dp.batch_size > 0:
+                bar_length = min(dp.batch_size, 8)
+                bar = "█" * bar_length + "░" * (8 - bar_length)
+                load_text = f"[{status_style}]{bar}[/{status_style}]"
+            else:
+                load_text = "[dim]░░░░░░░░░[/dim]"
+
+            table.add_row(
+                f"[{status_style}]DP{dp.dp_id} {emoji}[/{status_style}]",
+                f"[cyan]{dp.queue_depth}[/cyan]" if dp.queue_depth > 0 else "[dim]0[/dim]",
+                f"[dim]{dp.queue_tokens}[/dim]" if dp.queue_tokens > 0 else "[dim]0[/dim]",
+                f"[green]{dp.batch_size}[/green]" if dp.batch_size > 0 else "[dim]0[/dim]",
+                f"[dim]{dp.batch_tokens}[/dim]" if dp.batch_tokens > 0 else "[dim]0[/dim]",
+                f"[yellow]{dp.compute_time:.3f}s[/yellow]" if dp.compute_time > 0 else "[dim]0.000s[/dim]",
+                load_text,
+            )
+
+        return table
+
+    def _make_left_panel(self) -> Panel:
+        """Create the left panel with per-worker DP tables stacked vertically."""
+        # Create a table for each worker and stack them
+        tables = []
         for w in range(self.n_workers):
-            worker = workers.get(w, WorkerStatus(w, self.base_port + w * self.port_step))
-            
-            for dp in worker.dp_statuses:
-                # Status indicator
-                if dp.queue_depth > 0:
-                    status = "[yellow]BUSY[/yellow]"
-                else:
-                    status = "[dim]IDLE[/dim]"
+            table = self._make_worker_dp_table(w)
+            tables.append(table)
 
-                table.add_row(
-                    f"W{w}",
-                    f"D{dp.dp_id}",
-                    str(dp.port),
-                    str(dp.queue_depth),
-                    str(dp.queue_tokens) if dp.queue_tokens > 0 else "-",
-                    str(dp.batch_size) if dp.batch_size > 0 else "-",
-                    f"{dp.compute_time:.3f}s" if dp.compute_time > 0 else "-",
-                    status,
-                )
-
-        return Panel(table, border_style="dim")
-
-    def _make_worker_log_panel(self, worker_id: int) -> Panel:
-        """Create a single worker's log panel."""
-        log_text = Text()
-
-        # Get logs for this worker
-        worker_logs = self.log_handler.get_logs_for_worker(worker_id, self._logs_per_worker)
-
-        for i, log_entry in enumerate(worker_logs):
-            # Truncate long lines
-            if len(log_entry) > 90:
-                log_entry = log_entry[:87] + "..."
-            # Remove the logger name prefix for cleaner display
-            log_entry = self._clean_log_line(log_entry)
-            log_text.append(Text.from_ansi(log_entry))
-            if i < len(worker_logs) - 1:
-                log_text.append("\n")
-
-        # Fill empty lines to maintain height
-        for _ in range(self._logs_per_worker - len(worker_logs)):
-            log_text.append(" ")
-            log_text.append("\n")
-
-        return Panel(
-            log_text,
-            title=f"[bold cyan]Worker {worker_id}[/bold cyan]",
-            border_style="dim",
-            padding=(0, 1),
-            height=self._logs_per_worker + 2,
-        )
-
-    def _clean_log_line(self, log_entry: str) -> str:
-        """Clean up log line for display."""
-        # Remove common prefixes to save space
-        prefixes = [
-            "prefill_worker",
-            "prefill_swarm",
-            "uvicorn",
-        ]
-        for prefix in prefixes:
-            if prefix in log_entry.lower():
-                # Keep only timestamp + level + message
-                parts = log_entry.split(None, 2)  # Split into 3 parts
-                if len(parts) >= 3:
-                    return f"{parts[0]} {parts[1]:8} {parts[2]}"
-        return log_entry
-
-    def _make_logs_column(self) -> Panel:
-        """Create the right column with all worker log panels."""
-        # Stack worker log panels vertically
-        panels = []
-        for w in range(self.n_workers):
-            panel = self._make_worker_log_panel(w)
-            panels.append(panel)
-
-        content = Group(*panels)
+        content = Group(*tables)
 
         return Panel(
             content,
-            title="[bold magenta]Worker Logs[/bold magenta]",
+            title="[bold cyan]All Workers Status[/bold cyan]",
             border_style="dim",
+        )
+
+    def _make_logs_panel(self) -> Panel:
+        """Create the logs panel."""
+        logs = self.log_handler.get_logs(20)
+
+        log_text = Text()
+        for i, log_entry in enumerate(logs):
+            if len(log_entry) > 90:
+                log_entry = log_entry[:87] + "..."
+            log_text.append(Text.from_ansi(log_entry))
+            if i < len(logs) - 1:
+                log_text.append("\n")
+
+        return Panel(
+            log_text,
+            title="[bold magenta]Application Logs[/bold magenta]",
+            border_style="dim",
+            padding=(0, 1),
         )
 
     def _make_layout(self) -> Layout:
@@ -338,8 +306,8 @@ class SwarmDashboard:
         """Generate the complete layout."""
         layout = self._make_layout()
         layout["header"].update(self._make_header())
-        layout["left"].update(self._make_dp_table())
-        layout["right"].update(self._make_logs_column())
+        layout["left"].update(self._make_left_panel())
+        layout["right"].update(self._make_logs_panel())
         return layout
 
     def _run_loop(self) -> None:
@@ -381,14 +349,7 @@ class SwarmDashboard:
             self._thread = None
 
         # Restore logging
-        logger_names = [
-            "prefill_swarm",
-            "prefill_worker",
-            "uvicorn",
-            "uvicorn.error",
-        ] + [f"prefill-worker-{w}" for w in range(self.n_workers)]
-        
-        for logger_name in logger_names:
+        for logger_name in ("prefill_swarm", "uvicorn", "uvicorn.error"):
             logger = logging.getLogger(logger_name)
             logger.removeHandler(self.log_handler)
             logger.propagate = True
