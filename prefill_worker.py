@@ -639,8 +639,7 @@ class PrefillDashboard:
 
         log_panel = Panel(
             log_text,
-            title="Application Logs",
-            title_style="bold cyan",
+            title=Text("Application Logs", style="bold cyan"),
             border_style="dim",
             padding=(0, 1),
         )
