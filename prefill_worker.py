@@ -612,30 +612,14 @@ class PrefillDashboard:
         logs = self.log_handler.get_logs(50)
 
         if not logs:
-            log_text = Text("[dim]No logs yet...[/dim]", justify="left")
+            log_text = Text("No logs yet...", style="dim")
         else:
-            log_text = Text()
+            from rich.text import Text as RichText
+            log_text = RichText()
             for log_entry in logs:
-                # Parse and colorize log entry
-                if "INFO" in log_entry:
-                    log_entry = log_entry.replace("INFO", "[green]INFO[/green]")
-                elif "WARNING" in log_entry:
-                    log_entry = log_entry.replace("WARNING", "[yellow]WARNING[/yellow]")
-                elif "ERROR" in log_entry:
-                    log_entry = log_entry.replace("ERROR", "[red]ERROR[/red]")
-                elif "DEBUG" in log_entry:
-                    log_entry = log_entry.replace("DEBUG", "[dim]DEBUG[/dim]")
-
-                # Highlight DP info
-                if "[DP " in log_entry:
-                    import re
-                    log_entry = re.sub(r'\[DP (\d+)\]', r'[cyan][DP \1][/cyan]', log_entry)
-
-                # Highlight EP-group info
-                if "[EP-group]" in log_entry:
-                    log_entry = log_entry.replace("[EP-group]", "[bold magenta][EP-group][/bold magenta]")
-
-                log_text.append(log_entry + "\n")
+                # Use from_ansi to parse Rich's color codes properly
+                log_text.append(RichText.from_ansi(log_entry))
+                log_text.append("\n")
 
         log_panel = Panel(
             log_text,
