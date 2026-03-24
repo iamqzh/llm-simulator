@@ -2,6 +2,45 @@
 
 This project is a simulator for LLM inference prefill workers with EP (Execution Parallelism) group synchronization.
 
+## TUI Dashboard
+
+The simulator includes a real-time Text User Interface (TUI) dashboard for monitoring EP-group status.
+
+### Enabling TUI
+
+```bash
+# Enable TUI explicitly
+python prefill_worker.py --n-dp 4 --base-port 8100 --tui
+
+# Auto-enabled if rich is installed and running in a terminal
+python prefill_worker.py --n-dp 4 --base-port 8100
+
+# Disable TUI
+python prefill_worker.py --n-dp 4 --base-port 8100 --no-tui
+
+# Custom refresh rate (default 0.5s)
+python prefill_worker.py --n-dp 4 --base-port 8100 --tui --tui-refresh 0.2
+```
+
+### TUI Display
+
+The dashboard shows:
+
+1. **Header**: Title and configuration (number of DPs, port range)
+2. **EP-Group Status**: Current state (BUSY/IDLE), iteration count
+3. **DP Table**: Per-worker information
+   - Queue depth and tokens
+   - Active batch size and tokens
+   - Compute time
+   - Visual load bar
+4. **Summary**: Total queued/processing requests, max compute time
+
+### Installing Rich
+
+```bash
+pip install rich
+```
+
 ## Project Overview
 
 This simulator demonstrates the EP-group synchronization behavior in distributed LLM inference, where multiple Data Parallel (DP) workers share a single EP-sync scheduler.

@@ -69,6 +69,7 @@ import asyncio
 import logging
 import random
 import string
+import sys
 import time
 import uuid
 from collections import deque
@@ -79,6 +80,21 @@ from typing import Deque, List, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+# Rich imports for TUI
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich.align import Align
+    from rich.text import Text
+    from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    Console = None  # type: ignore
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -226,6 +242,40 @@ class EPGroupScheduler:
                 "active_batch_size": len(self._active_batches[dp_id]),
             }
 
+    def get_detailed_status(self) -> dict:
+        """Get detailed status for TUI display."""
+        with self._lock:
+            dp_details = []
+            for dp_id in range(self.n_dp):
+                queue = self._queues[dp_id]
+                batch = self._active_batches[dp_id]
+
+                # Calculate total tokens in queue and batch
+                queue_tokens = sum(req.prompt_tokens for req in queue)
+                batch_tokens = sum(req.prompt_tokens for req in batch)
+
+                # Calculate compute time for current batch
+                seq_lens = [r.prompt_tokens for r in batch]
+                compute_time = prefill_duration(seq_lens, self.cfg)
+
+                dp_details.append({
+                    "dp_id": dp_id,
+                    "queue_depth": len(queue),
+                    "queue_tokens": queue_tokens,
+                    "batch_size": len(batch),
+                    "batch_tokens": batch_tokens,
+                    "compute_time": compute_time,
+                })
+
+            return {
+                "n_dp": self.n_dp,
+                "busy": self._busy,
+                "iteration": self._iteration_count,
+                "dp_details": dp_details,
+                "max_batch_size": self.cfg.max_batch_size,
+                "max_seq_len": self.cfg.max_seq_len,
+            }
+
     # ── scheduler thread ──────────────────────────────────────────────────────
 
     def _scheduler_loop(self) -> None:
@@ -365,6 +415,233 @@ class EPGroupScheduler:
             result = {"error": error, "id": req.req_id}
         if self._loop is not None:
             req.complete(result, self._loop)
+
+
+# ── TUI Dashboard ────────────────────────────────────────────────────────────────
+
+class PrefillDashboard:
+    """
+    Real-time TUI dashboard for monitoring EP-group scheduler status.
+    Displays per-DP queue depth, batch info, compute times, and overall group status.
+    """
+
+    def __init__(self, scheduler: EPGroupScheduler, base_port: int, refresh_rate: float = 0.5):
+        if not RICH_AVAILABLE:
+            raise RuntimeError("Rich library is required for TUI. Install with: pip install rich")
+
+        self.scheduler = scheduler
+        self.base_port = base_port
+        self.refresh_rate = refresh_rate
+        self.console = Console()
+        self._running = False
+        self._thread = None
+
+        # Track statistics
+        self._total_requests = 0
+        self._total_iterations = 0
+        self._last_iteration = 0
+
+    def _make_header(self) -> Panel:
+        """Create the header panel."""
+        header_text = Text()
+        header_text.append("PREFILL WORKER DASHBOARD", style="bold cyan")
+        header_text.append(f" — DP {self.scheduler.n_dp} Workers", style="white")
+        header_text.append(f" — Ports {self.base_port}-{self.base_port + self.scheduler.n_dp - 1}", style="dim")
+
+        return Panel(
+            Align.center(header_text),
+            style="cyan on black",
+            padding=(0, 1),
+        )
+
+    def _make_group_status(self, status: dict) -> Panel:
+        """Create the EP-group status panel."""
+        busy = status["busy"]
+        iteration = status["iteration"]
+
+        # Update iteration counter
+        if iteration > self._last_iteration:
+            self._total_iterations += iteration - self._last_iteration
+            self._last_iteration = iteration
+
+        status_text = Text()
+        status_text.append("Status: ", style="dim")
+        if busy:
+            status_text.append("BUSY 🔥", style="bold red")
+        else:
+            status_text.append("IDLE 💤", style="bold green")
+
+        status_text.append("  |  ", style="dim")
+        status_text.append(f"Iteration: {iteration}", style="yellow")
+        status_text.append("  |  ", style="dim")
+        status_text.append(f"Total Iters: {self._total_iterations}", style="cyan")
+
+        return Panel(
+            Align.center(status_text),
+            style="white on black",
+            padding=(0, 2),
+        )
+
+    def _make_dp_table(self, status: dict) -> Table:
+        """Create the DP status table."""
+        table = Table(
+            title="Data Parallel Workers",
+            title_style="bold magenta",
+            header_style="bold cyan",
+            border_style="dim",
+            padding=(0, 1),
+        )
+
+        table.add_column("DP", style="bold", width=4)
+        table.add_column("Port", style="dim", width=6)
+        table.add_column("Queue", justify="right", width=6)
+        table.add_column("Queue Tokens", justify="right", width=12)
+        table.add_column("Active Batch", justify="right", width=6)
+        table.add_column("Batch Tokens", justify="right", width=12)
+        table.add_column("Compute Time", justify="right", width=12)
+        table.add_column("Load", width=15)
+
+        for dp in status["dp_details"]:
+            dp_id = dp["dp_id"]
+            port = self.base_port + dp_id
+            queue_depth = dp["queue_depth"]
+            queue_tokens = dp["queue_tokens"]
+            batch_size = dp["batch_size"]
+            batch_tokens = dp["batch_tokens"]
+            compute_time = dp["compute_time"]
+
+            # Color code based on load
+            if queue_depth == 0 and batch_size == 0:
+                status_style = "dim"
+                queue_emoji = "💤"
+            elif queue_depth > 10:
+                status_style = "red"
+                queue_emoji = "🔥"
+            elif queue_depth > 5:
+                status_style = "yellow"
+                queue_emoji = "⚠️"
+            else:
+                status_style = "green"
+                queue_emoji = "✅"
+
+            # Create load bar
+            max_batch = status["max_batch_size"]
+            batch_ratio = min(batch_size / max_batch, 1.0) if max_batch > 0 else 0
+            bar_length = int(batch_ratio * 15)
+            if batch_size > 0:
+                bar = "█" * bar_length + "░" * (15 - bar_length)
+                load_text = f"[{status_style}]{bar}[/{status_style}] {batch_size}/{max_batch}"
+            else:
+                load_text = "[dim]░░░░░░░░░░░░░░░[/dim]"
+
+            table.add_row(
+                f"[{status_style}]DP{dp_id} {queue_emoji}[/{status_style}]",
+                f"[dim]{port}[/dim]",
+                f"[cyan]{queue_depth}[/cyan]",
+                f"[dim]{queue_tokens}[/dim]",
+                f"[green]{batch_size}[/green]" if batch_size > 0 else "[dim]0[/dim]",
+                f"[dim]{batch_tokens}[/dim]",
+                f"[yellow]{compute_time:.4f}s[/yellow]" if compute_time > 0 else "[dim]0.0000s[/dim]",
+                load_text,
+            )
+
+        return table
+
+    def _make_summary(self, status: dict) -> Panel:
+        """Create the summary panel."""
+        dp_details = status["dp_details"]
+
+        total_queued = sum(dp["queue_depth"] for dp in dp_details)
+        total_processing = sum(dp["batch_size"] for dp in dp_details)
+        total_queue_tokens = sum(dp["queue_tokens"] for dp in dp_details)
+        total_batch_tokens = sum(dp["batch_tokens"] for dp in dp_details)
+        max_compute = max(dp["compute_time"] for dp in dp_details)
+
+        summary_text = Text()
+        summary_text.append("Queued: ", style="dim")
+        summary_text.append(f"{total_queued} requests", style="cyan")
+        summary_text.append(f" ({total_queue_tokens} tokens)", style="dim")
+
+        summary_text.append("  |  ", style="dim")
+        summary_text.append("Processing: ", style="dim")
+        summary_text.append(f"{total_processing} requests", style="green")
+        summary_text.append(f" ({total_batch_tokens} tokens)", style="dim")
+
+        summary_text.append("  |  ", style="dim")
+        summary_text.append("Max Compute: ", style="dim")
+        summary_text.append(f"{max_compute:.4f}s", style="yellow")
+
+        return Panel(
+            Align.center(summary_text),
+            style="white on black",
+            padding=(0, 2),
+        )
+
+    def _make_layout(self) -> Layout:
+        """Create the main layout."""
+        layout = Layout()
+
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="status", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="summary", size=3),
+        )
+
+        return layout
+
+    def _update_display(self) -> None:
+        """Update the display once."""
+        status = self.scheduler.get_detailed_status()
+
+        layout = self._make_layout()
+        layout["header"].update(self._make_header())
+        layout["status"].update(self._make_group_status(status))
+        layout["main"].update(self._make_dp_table(status))
+        layout["summary"].update(self._make_summary(status))
+
+        self.console.clear()
+        self.console.print(layout)
+
+    def _run_loop(self) -> None:
+        """Main TUI loop (runs in separate thread)."""
+        self._running = True
+
+        # Clear screen and hide cursor
+        self.console.clear()
+        self._update_display()
+
+        import time as _time
+        while self._running:
+            _time.sleep(self.refresh_rate)
+            if self._running:
+                self._update_display()
+
+    def start(self) -> None:
+        """Start the TUI dashboard in a background thread."""
+        if not RICH_AVAILABLE:
+            log.warning("Rich library not available, TUI disabled")
+            return
+
+        if self._running:
+            log.warning("Dashboard already running")
+            return
+
+        import threading
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="tui-dashboard")
+        self._thread.start()
+        log.info("TUI Dashboard started on %s", self.console)
+
+    def stop(self) -> None:
+        """Stop the TUI dashboard."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+        # Show cursor and clear
+        self.console.show_cursor()
+        log.info("TUI Dashboard stopped")
 
 
 # ── FastAPI app factory ───────────────────────────────────────────────────────
@@ -513,6 +790,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-seq-len",type=int,   default=4096, help="Max prompt token length")
     p.add_argument("--log-level",  type=str,   default="info",
                    choices=["debug", "info", "warning", "error"])
+    p.add_argument("--tui",        action="store_true", help="Enable TUI dashboard (requires rich)")
+    p.add_argument("--no-tui",     action="store_true", help="Disable TUI dashboard")
+    p.add_argument("--tui-refresh",type=float, default=0.5, help="TUI refresh rate in seconds")
     return p.parse_args()
 
 
@@ -540,6 +820,7 @@ def main() -> None:
 
     servers = []
     threads = []
+    dashboard = None
 
     for i, app in enumerate(apps):
         port   = args.base_port + i
@@ -563,12 +844,32 @@ def main() -> None:
         t.start()
         log.info("  DP %d  → http://%s:%d", i, args.host, port)
 
+    # Start TUI dashboard if enabled
+    enable_tui = args.tui
+    if not enable_tui and not args.no_tui and RICH_AVAILABLE:
+        # Auto-enable TUI if rich is available and no explicit flag
+        enable_tui = sys.stdout.isatty()  # Only enable if running in terminal
+
+    if enable_tui:
+        try:
+            dashboard = PrefillDashboard(
+                scheduler=scheduler,
+                base_port=args.base_port,
+                refresh_rate=args.tui_refresh,
+            )
+            dashboard.start()
+        except Exception as e:
+            log.warning("Failed to start TUI dashboard: %s", e)
+            dashboard = None
+
     # keep the main thread alive; Ctrl-C shuts everything down
     try:
         for t in threads:
             t.join()
     except KeyboardInterrupt:
         log.info("Shutting down …")
+        if dashboard:
+            dashboard.stop()
         for s in servers:
             s.should_exit = True
 
