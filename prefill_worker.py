@@ -419,10 +419,36 @@ class EPGroupScheduler:
 
 # ── TUI Dashboard ────────────────────────────────────────────────────────────────
 
+class TUILogHandler(logging.Handler):
+    """Custom log handler that captures logs for TUI display."""
+
+    def __init__(self, max_logs: int = 100):
+        super().__init__()
+        self.logs = []
+        self.max_logs = max_logs
+        self._lock = __import__("threading").Lock()
+
+    def emit(self, record):
+        """Capture log record."""
+        try:
+            log_entry = self.format(record)
+            with self._lock:
+                self.logs.append(log_entry)
+                if len(self.logs) > self.max_logs:
+                    self.logs.pop(0)
+        except Exception:
+            self.handleError(record)
+
+    def get_logs(self, count: int = 50) -> List[str]:
+        """Get the last N log entries."""
+        with self._lock:
+            return self.logs[-count:] if count < len(self.logs) else self.logs.copy()
+
+
 class PrefillDashboard:
     """
     Real-time TUI dashboard for monitoring EP-group scheduler status.
-    Displays per-DP queue depth, batch info, compute times, and overall group status.
+    Left panel: DP load status, Right panel: Application logs.
     """
 
     def __init__(self, scheduler: EPGroupScheduler, base_port: int, refresh_rate: float = 0.5):
@@ -440,6 +466,11 @@ class PrefillDashboard:
         self._total_requests = 0
         self._total_iterations = 0
         self._last_iteration = 0
+
+        # Setup log handler
+        self.log_handler = TUILogHandler(max_logs=200)
+        self.log_handler.setFormatter(logging.Formatter('%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S'))
+        logging.getLogger("prefill_server").addHandler(self.log_handler)
 
     def _make_header(self) -> Panel:
         """Create the header panel."""
@@ -490,20 +521,20 @@ class PrefillDashboard:
             header_style="bold cyan",
             border_style="dim",
             padding=(0, 1),
+            show_header=True,
+            show_lines=False,
         )
 
-        table.add_column("DP", style="bold", width=4)
-        table.add_column("Port", style="dim", width=6)
+        table.add_column("DP", style="bold", width=6)
         table.add_column("Queue", justify="right", width=6)
-        table.add_column("Queue Tokens", justify="right", width=12)
-        table.add_column("Active Batch", justify="right", width=6)
-        table.add_column("Batch Tokens", justify="right", width=12)
-        table.add_column("Compute Time", justify="right", width=12)
-        table.add_column("Load", width=15)
+        table.add_column("Tokens", justify="right", width=8)
+        table.add_column("Batch", justify="right", width=6)
+        table.add_column("Tokens", justify="right", width=8)
+        table.add_column("Compute", justify="right", width=10)
+        table.add_column("Load", width=16)
 
         for dp in status["dp_details"]:
             dp_id = dp["dp_id"]
-            port = self.base_port + dp_id
             queue_depth = dp["queue_depth"]
             queue_tokens = dp["queue_tokens"]
             batch_size = dp["batch_size"]
@@ -527,21 +558,20 @@ class PrefillDashboard:
             # Create load bar
             max_batch = status["max_batch_size"]
             batch_ratio = min(batch_size / max_batch, 1.0) if max_batch > 0 else 0
-            bar_length = int(batch_ratio * 15)
+            bar_length = int(batch_ratio * 10)
             if batch_size > 0:
-                bar = "█" * bar_length + "░" * (15 - bar_length)
+                bar = "█" * bar_length + "░" * (10 - bar_length)
                 load_text = f"[{status_style}]{bar}[/{status_style}] {batch_size}/{max_batch}"
             else:
-                load_text = "[dim]░░░░░░░░░░░░░░░[/dim]"
+                load_text = "[dim]░░░░░░░░░░░[/dim]"
 
             table.add_row(
                 f"[{status_style}]DP{dp_id} {queue_emoji}[/{status_style}]",
-                f"[dim]{port}[/dim]",
                 f"[cyan]{queue_depth}[/cyan]",
                 f"[dim]{queue_tokens}[/dim]",
                 f"[green]{batch_size}[/green]" if batch_size > 0 else "[dim]0[/dim]",
                 f"[dim]{batch_tokens}[/dim]",
-                f"[yellow]{compute_time:.4f}s[/yellow]" if compute_time > 0 else "[dim]0.0000s[/dim]",
+                f"[yellow]{compute_time:.3f}s[/yellow]" if compute_time > 0 else "[dim]0.000s[/dim]",
                 load_text,
             )
 
@@ -559,17 +589,17 @@ class PrefillDashboard:
 
         summary_text = Text()
         summary_text.append("Queued: ", style="dim")
-        summary_text.append(f"{total_queued} requests", style="cyan")
-        summary_text.append(f" ({total_queue_tokens} tokens)", style="dim")
+        summary_text.append(f"{total_queued} req", style="cyan")
+        summary_text.append(f" ({total_queue_tokens} tok)", style="dim")
 
         summary_text.append("  |  ", style="dim")
-        summary_text.append("Processing: ", style="dim")
-        summary_text.append(f"{total_processing} requests", style="green")
-        summary_text.append(f" ({total_batch_tokens} tokens)", style="dim")
+        summary_text.append("Active: ", style="dim")
+        summary_text.append(f"{total_processing} req", style="green")
+        summary_text.append(f" ({total_batch_tokens} tok)", style="dim")
 
         summary_text.append("  |  ", style="dim")
-        summary_text.append("Max Compute: ", style="dim")
-        summary_text.append(f"{max_compute:.4f}s", style="yellow")
+        summary_text.append("Max: ", style="dim")
+        summary_text.append(f"{max_compute:.3f}s", style="yellow")
 
         return Panel(
             Align.center(summary_text),
@@ -577,15 +607,73 @@ class PrefillDashboard:
             padding=(0, 2),
         )
 
+    def _make_log_panel(self) -> Panel:
+        """Create the log viewer panel."""
+        logs = self.log_handler.get_logs(50)
+
+        if not logs:
+            log_text = Text("[dim]No logs yet...[/dim]", justify="left")
+        else:
+            log_text = Text()
+            for log_entry in logs:
+                # Parse and colorize log entry
+                if "INFO" in log_entry:
+                    log_entry = log_entry.replace("INFO", "[green]INFO[/green]")
+                elif "WARNING" in log_entry:
+                    log_entry = log_entry.replace("WARNING", "[yellow]WARNING[/yellow]")
+                elif "ERROR" in log_entry:
+                    log_entry = log_entry.replace("ERROR", "[red]ERROR[/red]")
+                elif "DEBUG" in log_entry:
+                    log_entry = log_entry.replace("DEBUG", "[dim]DEBUG[/dim]")
+
+                # Highlight DP info
+                if "[DP " in log_entry:
+                    import re
+                    log_entry = re.sub(r'\[DP (\d+)\]', r'[cyan][DP \1][/cyan]', log_entry)
+
+                # Highlight EP-group info
+                if "[EP-group]" in log_entry:
+                    log_entry = log_entry.replace("[EP-group]", "[bold magenta][EP-group][/bold magenta]")
+
+                log_text.append(log_entry + "\n")
+
+        log_panel = Panel(
+            log_text,
+            title="Application Logs",
+            title_style="bold cyan",
+            border_style="dim",
+            padding=(0, 1),
+        )
+
+        return log_panel
+
+    def _make_left_panel(self, status: dict) -> Layout:
+        """Create the left panel with DP status."""
+        layout = Layout()
+        layout.split_column(
+            Layout(name="status", size=3),
+            Layout(name="table", ratio=1),
+            Layout(name="summary", size=3),
+        )
+
+        layout["status"].update(self._make_group_status(status))
+        layout["table"].update(self._make_dp_table(status))
+        layout["summary"].update(self._make_summary(status))
+
+        return layout
+
     def _make_layout(self) -> Layout:
-        """Create the main layout."""
+        """Create the main split layout (left: DP status, right: logs)."""
         layout = Layout()
 
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="status", size=3),
             Layout(name="main", ratio=1),
-            Layout(name="summary", size=3),
+        )
+
+        layout["main"].split_row(
+            Layout(name="left", ratio=1),
+            Layout(name="right", ratio=1),
         )
 
         return layout
@@ -596,9 +684,8 @@ class PrefillDashboard:
 
         layout = self._make_layout()
         layout["header"].update(self._make_header())
-        layout["status"].update(self._make_group_status(status))
-        layout["main"].update(self._make_dp_table(status))
-        layout["summary"].update(self._make_summary(status))
+        layout["left"].update(self._make_left_panel(status))
+        layout["right"].update(self._make_log_panel())
 
         self.console.clear()
         self.console.print(layout)
@@ -638,6 +725,9 @@ class PrefillDashboard:
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None
+
+        # Remove log handler
+        logging.getLogger("prefill_server").removeHandler(self.log_handler)
 
         # Show cursor and clear
         self.console.show_cursor()
