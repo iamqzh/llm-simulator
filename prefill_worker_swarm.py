@@ -8,10 +8,10 @@ Architecture
 ────────────
   ┌─ Swarm Manager (this process) ──────────────────────────────┐
   │                                                             │
-  │  ┌─ Worker 0 ──┐  ┌─ Worker 1 ──┐  ┌─ Worker N ──┐         │
-  │  │ EP-Group 0  │  │ EP-Group 1  │  │ EP-Group N  │         │
-  │  │ Ports 8100+ │  │ Ports 8200+ │  │ Ports 8300+ │         │
-  │  └─────────────┘  └─────────────┘  └─────────────┘         │
+  │  ┌─ Worker 0 ──┐  ┌─ Worker 1 ──┐  ┌─ Worker N ──┐          │
+  │  │ EP-Group 0  │  │ EP-Group 1  │  │ EP-Group N  │          │
+  │  │ Ports 8100+ │  │ Ports 8200+ │  │ Ports 8300+ │          │
+  │  └─────────────┘  └─────────────┘  └─────────────┘          │
   │                                                             │
   │  Unified TUI Dashboard (all workers + per-worker logs)      │
   └─────────────────────────────────────────────────────────────┘
@@ -73,11 +73,26 @@ def run_worker(config: WorkerConfig) -> None:
 
     import uvicorn
 
+    # Configure logging with worker ID prefix
+    worker_logger_name = f"prefill-worker-{config.worker_id}"
+    logger = logging.getLogger(worker_logger_name)
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers and add our own with worker prefix
+    logger.handlers = []
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter(
+            f"%(asctime)s  %(levelname)-8s  [{worker_logger_name}] %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    logger.addHandler(handler)
+
     # Set process title for debugging
     try:
         import setproctitle
-
-        setproctitle.setproctitle(f"prefill-worker-{config.worker_id}")
+        setproctitle.setproctitle(worker_logger_name)
     except ImportError:
         pass
 
@@ -92,9 +107,8 @@ def run_worker(config: WorkerConfig) -> None:
     # Build one FastAPI app per DP
     apps = [make_app(dp_id=i, scheduler=scheduler) for i in range(config.n_dp)]
 
-    log.info(
-        "Worker %d starting %d DP servers on ports %d-%d",
-        config.worker_id,
+    logger.info(
+        "Starting %d DP servers on ports %d-%d",
         config.n_dp,
         config.base_port,
         config.base_port + config.n_dp - 1,
@@ -125,14 +139,14 @@ def run_worker(config: WorkerConfig) -> None:
         )
         threads.append(t)
         t.start()
-        log.info("  Worker %d DP %d → http://%s:%d", config.worker_id, i, config.host, port)
+        logger.info("  DP %d → http://%s:%d", i, config.host, port)
 
     # Keep worker alive
     try:
         for t in threads:
             t.join()
     except KeyboardInterrupt:
-        log.info("Worker %d shutting down...", config.worker_id)
+        logger.info("Shutting down...")
         for s in servers:
             s.should_exit = True
 
