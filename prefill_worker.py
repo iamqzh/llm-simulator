@@ -83,14 +83,14 @@ from fastapi.responses import JSONResponse
 
 # Rich imports for TUI
 try:
-    from rich.console import Console
-    from rich.live import Live
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.layout import Layout
     from rich.align import Align
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
     from rich.text import Text
-    from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
@@ -107,12 +107,13 @@ log = logging.getLogger("prefill_server")
 
 # ── compute model ─────────────────────────────────────────────────────────────
 
+
 @dataclass
 class PrefillComputeConfig:
-    alpha: float = 10   # attention quadratic coeff  [s / token²]
-    beta:  float = 20   # MoE linear coeff           [s / token]
+    alpha: float = 10  # attention quadratic coeff  [s / token²]
+    beta: float = 20  # MoE linear coeff           [s / token]
     max_batch_size: int = 32
-    max_seq_len:    int = 4096
+    max_seq_len: int = 4096
 
 
 def prefill_duration(seq_lens: List[int], cfg: PrefillComputeConfig) -> float:
@@ -125,6 +126,7 @@ def prefill_duration(seq_lens: List[int], cfg: PrefillComputeConfig) -> float:
 # ── token helpers ─────────────────────────────────────────────────────────────
 
 _VOCAB = string.ascii_letters + string.digits + "  "
+
 
 def _random_tokens(n: int) -> str:
     """Generate a random string resembling tokenised output."""
@@ -143,17 +145,18 @@ def _count_prompt_tokens(prompt: str) -> int:
 
 # ── pending request ───────────────────────────────────────────────────────────
 
+
 @dataclass
 class PendingRequest:
-    req_id:        str
-    dp_id:         int
+    req_id: str
+    dp_id: int
     prompt_tokens: int
-    max_tokens:    int
-    arrived_at:    float = field(default_factory=time.monotonic)
+    max_tokens: int
+    arrived_at: float = field(default_factory=time.monotonic)
 
     # filled when the iteration completes
-    result:        Optional[dict] = field(default=None, repr=False)
-    _event:        asyncio.Event  = field(default=None,  repr=False)
+    result: Optional[dict] = field(default=None, repr=False)
+    _event: asyncio.Event = field(default=None, repr=False)
 
     def set_event(self, loop: asyncio.AbstractEventLoop) -> None:
         """Must be called from within the target event loop."""
@@ -170,6 +173,7 @@ class PendingRequest:
 
 # ── EP-group scheduler (runs in a background thread) ─────────────────────────
 
+
 class EPGroupScheduler:
     """
     Manages N DP queues with EP-synchronised iteration execution.
@@ -181,14 +185,14 @@ class EPGroupScheduler:
 
     def __init__(self, n_dp: int, cfg: PrefillComputeConfig) -> None:
         self.n_dp = n_dp
-        self.cfg  = cfg
+        self.cfg = cfg
 
         # per-DP waiting queues
         self._queues: List[Deque[PendingRequest]] = [deque() for _ in range(n_dp)]
         self._lock = __import__("threading").Lock()
 
         # group state
-        self._busy            = False
+        self._busy = False
         self._iteration_count = 0
         self._active_batches: List[List[PendingRequest]] = [[] for _ in range(n_dp)]
 
@@ -200,9 +204,12 @@ class EPGroupScheduler:
 
         # start scheduler thread
         import threading
+
         t = threading.Thread(target=self._scheduler_loop, daemon=True, name="ep-scheduler")
         t.start()
-        log.info("EPGroupScheduler started  n_dp=%d  max_batch=%d  max_seq=%d", n_dp, cfg.max_batch_size, cfg.max_seq_len)
+        log.info(
+            "EPGroupScheduler started  n_dp=%d  max_batch=%d  max_seq=%d", n_dp, cfg.max_batch_size, cfg.max_seq_len
+        )
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -218,27 +225,31 @@ class EPGroupScheduler:
             self._loop = loop
         with self._lock:
             self._queues[dp_id].append(req)
-            log.info("[DP %d] ENQUEUE  req=%s  prompt_tokens=%d  queue_depth=%d",
-                     dp_id, req.req_id[:8], req.prompt_tokens,
-                     len(self._queues[dp_id]))
+            log.info(
+                "[DP %d] ENQUEUE  req=%s  prompt_tokens=%d  queue_depth=%d",
+                dp_id,
+                req.req_id[:8],
+                req.prompt_tokens,
+                len(self._queues[dp_id]),
+            )
         self._has_work.set()
 
     def group_status(self) -> dict:
         with self._lock:
             return {
-                "busy":           self._busy,
-                "iteration":      self._iteration_count,
-                "queue_depths":   [len(q) for q in self._queues],
+                "busy": self._busy,
+                "iteration": self._iteration_count,
+                "queue_depths": [len(q) for q in self._queues],
                 "active_batches": [len(b) for b in self._active_batches],
             }
 
     def dp_status(self, dp_id: int) -> dict:
         with self._lock:
             return {
-                "dp_id":             dp_id,
-                "queue_depth":       len(self._queues[dp_id]),
-                "group_busy":        self._busy,
-                "group_iteration":   self._iteration_count,
+                "dp_id": dp_id,
+                "queue_depth": len(self._queues[dp_id]),
+                "group_busy": self._busy,
+                "group_iteration": self._iteration_count,
                 "active_batch_size": len(self._active_batches[dp_id]),
             }
 
@@ -258,14 +269,16 @@ class EPGroupScheduler:
                 seq_lens = [r.prompt_tokens for r in batch]
                 compute_time = prefill_duration(seq_lens, self.cfg)
 
-                dp_details.append({
-                    "dp_id": dp_id,
-                    "queue_depth": len(queue),
-                    "queue_tokens": queue_tokens,
-                    "batch_size": len(batch),
-                    "batch_tokens": batch_tokens,
-                    "compute_time": compute_time,
-                })
+                dp_details.append(
+                    {
+                        "dp_id": dp_id,
+                        "queue_depth": len(queue),
+                        "queue_tokens": queue_tokens,
+                        "batch_size": len(batch),
+                        "batch_tokens": batch_tokens,
+                        "compute_time": compute_time,
+                    }
+                )
 
             return {
                 "n_dp": self.n_dp,
@@ -287,7 +300,7 @@ class EPGroupScheduler:
             while True:
                 batches = self._try_form_batches()
                 if not batches:
-                    break   # all queues empty → go back to sleep
+                    break  # all queues empty → go back to sleep
 
                 self._run_iteration(batches)
 
@@ -309,9 +322,13 @@ class EPGroupScheduler:
                 for req in q:
                     # Check if single request exceeds max_seq_len
                     if req.prompt_tokens > self.cfg.max_seq_len:
-                        log.warning("[DP %d] DROP req=%s prompt_tokens=%d > max_seq_len=%d",
-                                    dp_id, req.req_id[:8],
-                                    req.prompt_tokens, self.cfg.max_seq_len)
+                        log.warning(
+                            "[DP %d] DROP req=%s prompt_tokens=%d > max_seq_len=%d",
+                            dp_id,
+                            req.req_id[:8],
+                            req.prompt_tokens,
+                            self.cfg.max_seq_len,
+                        )
                         # complete with an error result immediately
                         self._complete_request(req, error="prompt exceeds max_seq_len")
                         continue
@@ -347,7 +364,10 @@ class EPGroupScheduler:
             durations.append(t)
             log.info(
                 "[DP %d] sub-batch size=%d  seq_lens=%s  compute=%.4fs",
-                dp_id, len(batch), seq_lens, t,
+                dp_id,
+                len(batch),
+                seq_lens,
+                t,
             )
         print(durations)
 
@@ -379,27 +399,27 @@ class EPGroupScheduler:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _build_result(self, req: PendingRequest, finish_time: float) -> dict:
-        elapsed   = finish_time - req.arrived_at
-        out_text  = _random_tokens(req.max_tokens)
+        elapsed = finish_time - req.arrived_at
+        out_text = _random_tokens(req.max_tokens)
         return {
-            "id":      f"cmpl-{req.req_id}",
-            "object":  "text_completion",
+            "id": f"cmpl-{req.req_id}",
+            "object": "text_completion",
             "created": int(time.time()),
-            "model":   "prefill-simulator",
+            "model": "prefill-simulator",
             "choices": [
                 {
-                    "text":          out_text,
-                    "index":         0,
+                    "text": out_text,
+                    "index": 0,
                     "finish_reason": "length",
                 }
             ],
             "usage": {
-                "prompt_tokens":     req.prompt_tokens,
+                "prompt_tokens": req.prompt_tokens,
                 "completion_tokens": req.max_tokens,
-                "total_tokens":      req.prompt_tokens + req.max_tokens,
+                "total_tokens": req.prompt_tokens + req.max_tokens,
             },
             "_sim": {
-                "dp_id":          req.dp_id,
+                "dp_id": req.dp_id,
                 "prefill_time_s": round(elapsed, 6),
             },
         }
@@ -408,7 +428,7 @@ class EPGroupScheduler:
         self,
         req: PendingRequest,
         result: Optional[dict] = None,
-        error: Optional[str]   = None,
+        error: Optional[str] = None,
     ) -> None:
         """Called under self._lock. Signals the waiting coroutine."""
         if error:
@@ -418,6 +438,7 @@ class EPGroupScheduler:
 
 
 # ── TUI Dashboard ────────────────────────────────────────────────────────────────
+
 
 class TUILogHandler(logging.Handler):
     """Custom log handler that captures logs for TUI display."""
@@ -469,7 +490,9 @@ class PrefillDashboard:
 
         # Setup log handler
         self.log_handler = TUILogHandler(max_logs=200)
-        self.log_handler.setFormatter(logging.Formatter('%(asctime)s  %(levelname)-8s  %(message)s', datefmt='%H:%M:%S'))
+        self.log_handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
+        )
         logging.getLogger("prefill_server").addHandler(self.log_handler)
 
     def _make_header(self) -> Panel:
@@ -615,6 +638,7 @@ class PrefillDashboard:
             log_text = Text("No logs yet...", style="dim")
         else:
             from rich.text import Text as RichText
+
             log_text = RichText()
             for log_entry in logs:
                 # Use from_ansi to parse Rich's color codes properly
@@ -661,8 +685,8 @@ class PrefillDashboard:
 
         return layout
 
-    def _update_display(self) -> None:
-        """Update the display once."""
+    def _generate_layout(self) -> Layout:
+        """Generate the complete layout for Live display."""
         status = self.scheduler.get_detailed_status()
 
         layout = self._make_layout()
@@ -670,22 +694,25 @@ class PrefillDashboard:
         layout["left"].update(self._make_left_panel(status))
         layout["right"].update(self._make_log_panel())
 
-        self.console.clear()
-        self.console.print(layout)
+        return layout
 
     def _run_loop(self) -> None:
-        """Main TUI loop (runs in separate thread)."""
+        """Main TUI loop using Rich Live for smooth updates."""
         self._running = True
 
-        # Clear screen and hide cursor
-        self.console.clear()
-        self._update_display()
+        # Use Rich Live for flicker-free updates with alternate screen buffer
+        with Live(
+            self._generate_layout(),
+            console=self.console,
+            refresh_per_second=4,
+            screen=True,
+            transient=False,
+        ) as live:
+            import time as _time
 
-        import time as _time
-        while self._running:
-            _time.sleep(self.refresh_rate)
-            if self._running:
-                self._update_display()
+            while self._running:
+                live.update(self._generate_layout())
+                _time.sleep(self.refresh_rate)
 
     def start(self) -> None:
         """Start the TUI dashboard in a background thread."""
@@ -698,6 +725,7 @@ class PrefillDashboard:
             return
 
         import threading
+
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="tui-dashboard")
         self._thread.start()
         log.info("TUI Dashboard started on %s", self.console)
@@ -718,6 +746,7 @@ class PrefillDashboard:
 
 
 # ── FastAPI app factory ───────────────────────────────────────────────────────
+
 
 def make_app(dp_id: int, scheduler: EPGroupScheduler) -> FastAPI:
     """
@@ -821,20 +850,20 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler) -> FastAPI:
 
         # wrap into chat completions format
         chat_result = {
-            "id":      result["id"].replace("cmpl-", "chatcmpl-"),
-            "object":  "chat.completion",
+            "id": result["id"].replace("cmpl-", "chatcmpl-"),
+            "object": "chat.completion",
             "created": result["created"],
-            "model":   result["model"],
+            "model": result["model"],
             "choices": [
                 {
-                    "index":         0,
-                    "message":       {"role": "assistant", "content": result["choices"][0]["text"]},
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result["choices"][0]["text"]},
                     "finish_reason": "length",
                 }
             ],
             "usage": result["usage"],
             "kv_transfer_params": kv_transfer_response,
-            "_sim":  result["_sim"],
+            "_sim": result["_sim"],
         }
         return JSONResponse(content=chat_result)
 
@@ -852,20 +881,20 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler) -> FastAPI:
 
 # ── multi-server launcher ─────────────────────────────────────────────────────
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Prefill EP-Group simulator server")
-    p.add_argument("--n-dp",       type=int,   default=2,    help="Number of DP workers")
-    p.add_argument("--base-port",  type=int,   default=8100, help="First DP port (DP-i uses base+i)")
-    p.add_argument("--host",       type=str,   default="0.0.0.0")
-    p.add_argument("--alpha",      type=float, default=30/100, help="Attention quadratic coeff [s/tok²]")
-    p.add_argument("--beta",       type=float, default=5/100, help="MoE linear coeff [s/tok]")
-    p.add_argument("--max-batch",  type=int,   default=32,   help="Max requests per DP per iteration")
-    p.add_argument("--max-seq-len",type=int,   default=4096, help="Max prompt token length")
-    p.add_argument("--log-level",  type=str,   default="info",
-                   choices=["debug", "info", "warning", "error"])
-    p.add_argument("--tui",        action="store_true", help="Enable TUI dashboard (requires rich)")
-    p.add_argument("--no-tui",     action="store_true", help="Disable TUI dashboard")
-    p.add_argument("--tui-refresh",type=float, default=0.5, help="TUI refresh rate in seconds")
+    p.add_argument("--n-dp", type=int, default=2, help="Number of DP workers")
+    p.add_argument("--base-port", type=int, default=8100, help="First DP port (DP-i uses base+i)")
+    p.add_argument("--host", type=str, default="0.0.0.0")
+    p.add_argument("--alpha", type=float, default=30 / 100, help="Attention quadratic coeff [s/tok²]")
+    p.add_argument("--beta", type=float, default=5 / 100, help="MoE linear coeff [s/tok]")
+    p.add_argument("--max-batch", type=int, default=32, help="Max requests per DP per iteration")
+    p.add_argument("--max-seq-len", type=int, default=4096, help="Max prompt token length")
+    p.add_argument("--log-level", type=str, default="info", choices=["debug", "info", "warning", "error"])
+    p.add_argument("--tui", action="store_true", help="Enable TUI dashboard (requires rich)")
+    p.add_argument("--no-tui", action="store_true", help="Disable TUI dashboard")
+    p.add_argument("--tui-refresh", type=float, default=0.5, help="TUI refresh rate in seconds")
     return p.parse_args()
 
 
@@ -886,7 +915,9 @@ def main() -> None:
 
     log.info(
         "Starting %d DP servers on ports %d-%d",
-        args.n_dp, args.base_port, args.base_port + args.n_dp - 1,
+        args.n_dp,
+        args.base_port,
+        args.base_port + args.n_dp - 1,
     )
 
     import threading
@@ -896,7 +927,7 @@ def main() -> None:
     dashboard = None
 
     for i, app in enumerate(apps):
-        port   = args.base_port + i
+        port = args.base_port + i
         config = uvicorn.Config(
             app,
             host=args.host,
