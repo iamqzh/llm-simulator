@@ -3,12 +3,12 @@ decode_tui.py  —  TUI dashboard for the Decode EP-Group simulator
 
 Layout
 ──────
-┌─ Header ──────────────────────────────────────────────────────────────────┐
+┌─ Header ─────────────────────────────────────────────────────────────────┐
 │  DECODE EP-GROUP  •  N DP Workers  •  Step=K  •  Batch cap=M             │
 ├─ DP Status (left, 60%) ──────────────────────┬─ Logs (right, 40%) ───────┤
 │ ┌─ DP 0 ──────────────────────────────────┐  │  12:34:01 INFO ...        │
 │ │ Active 3/8  Waiting 1  Step 0.0023s     │  │  12:34:01 INFO ...        │
-│ │ req_id  cur_len  gen/max  progress       │  │  ...                      │
+│ │ req_id  cur_len  gen/max  progress      │  │  ...                      │
 │ │ 1b60b0d6  45      12/100  ████░░  12%   │  │                           │
 │ │ ...                                     │  │                           │
 │ └─────────────────────────────────────────┘  │                           │

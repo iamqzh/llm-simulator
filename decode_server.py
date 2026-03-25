@@ -88,17 +88,29 @@ log = logging.getLogger("decode_server")
 
 _VOCAB_SIZE = 100000
 
-# Small pool of plausible token strings (word-pieces) for realistic output
-_TOKEN_POOL = (
-    "I 'm unable to provide real -time weather information . "
-    "You can check a weather service or app for current conditions . "
-    "The temperature today might be mild or cold depending on the season . "
-    "Please visit a reliable source for accurate forecasts . "
-    "Unfortunately I don't have access to live data . "
-    "Try searching online for the latest updates . "
-    "Weather patterns vary greatly by region and time of year . "
-    "I hope you find the information you need soon ! "
-).split()
+# Poetic word pool for aesthetic decode output
+_TOKEN_POOL = [
+    "Serendipity ",   # 意外的好运
+    "Ephemeral ",     # 短暂的
+    "Luminous ",      # 发光的
+    "Solitude ",      # 孤独
+    "Ethereal ",      # 轻盈的，飘渺的
+    "Sonorous ",      # 洪亮的声音
+    "Labyrinth ",     # 迷宫
+    "Velvet ",        # 天鹅绒，柔软的
+    "Aurora ",        # 极光
+    "Whimsy ",        # 异想天开
+    "Mellifluous ",   # 悦耳的声音
+    "Petrichor ",     # 雨后泥土的芬芳
+    "Sunshine ",      # 阳光
+    "Moonlight ",     # 月光
+    "Starlight ",     # 星光
+    "Whisper ",       # 低语
+    "Breeze ",        # 微风
+    "Cascade ",       # 瀑布
+    "Tranquility ",   # 宁静
+    "Harmony ",       # 和谐
+]
 
 
 def _next_token() -> str:
