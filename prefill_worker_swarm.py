@@ -9,10 +9,10 @@ Architecture
 ────────────
   ┌─ Swarm Manager (this process) ──────────────────────────────┐
   │                                                             │
-  │  ┌─ Worker 0 ──┐  ┌─ Worker 1 ──┐  ┌─ Worker N ──┐         │
-  │  │ EP-Group 0  │  │ EP-Group 1  │  │ EP-Group N  │         │
-  │  │ Ports 8100+ │  │ Ports 8200+ │  │ Ports 8300+ │         │
-  │  └─────────────┘  └─────────────┘  └─────────────┘         │
+  │  ┌─ Worker 0 ──┐  ┌─ Worker 1 ──┐  ┌─ Worker N ──┐          │
+  │  │ EP-Group 0  │  │ EP-Group 1  │  │ EP-Group N  │          │
+  │  │ Ports 8100+ │  │ Ports 8200+ │  │ Ports 8300+ │          │
+  │  └─────────────┘  └─────────────┘  └─────────────┘          │
   │         │                │                │                 │
   │         └────────────────┴────────────────┘                 │
   │                      │                                      │
@@ -37,7 +37,7 @@ import threading
 import time
 from dataclasses import dataclass
 from multiprocessing import Manager
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 # TUI Dashboard (optional)
 try:
@@ -69,16 +69,44 @@ class WorkerConfig:
     max_seq_len: int = 4096
 
 
-def run_worker(config: WorkerConfig, shared_state: Optional[Dict] = None) -> None:
+class QueueLogHandler(logging.Handler):
+    """Logging handler that sends pre-formatted log strings to a multiprocessing.Queue."""
+
+    def __init__(self, q):
+        super().__init__()
+        self._queue = q
+
+    def emit(self, record):
+        try:
+            self._queue.put_nowait(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+def run_worker(config: WorkerConfig, shared_state, log_queue) -> None:
     """Run a single worker process with state reporting."""
     import uvicorn
 
     from prefill_worker import EPGroupScheduler, PrefillComputeConfig, make_app
 
-    # Set process title for debugging
+    # ── redirect ALL loggers in this process to the cross-process queue ───────
+    fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  W{wid}  %(name)s  %(message)s".format(wid=config.worker_id),
+        datefmt="%H:%M:%S",
+    )
+    queue_handler = QueueLogHandler(log_queue)
+    queue_handler.setFormatter(fmt)
+
+    # Attach to the root logger so every logger in this process is captured,
+    # including prefill_server, uvicorn, asyncio, etc.
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(queue_handler)
+    root.setLevel(logging.INFO)
+
+    # ── optional process title ────────────────────────────────────────────────
     try:
         import setproctitle
-
         setproctitle.setproctitle(f"prefill-worker-{config.worker_id}")
     except ImportError:
         pass
@@ -111,7 +139,7 @@ def run_worker(config: WorkerConfig, shared_state: Optional[Dict] = None) -> Non
             app,
             host=config.host,
             port=port,
-            log_level="warning",  # Reduce uvicorn log noise
+            log_level="warning",
             access_log=False,
             loop="asyncio",
         )
@@ -126,47 +154,39 @@ def run_worker(config: WorkerConfig, shared_state: Optional[Dict] = None) -> Non
         threads.append(t)
         t.start()
 
-    # Status reporting thread
+    # ── status reporting thread ───────────────────────────────────────────────
     def report_status():
-        """Periodically report status to shared state."""
         while True:
-            if shared_state is not None:
-                try:
-                    status = scheduler.get_detailed_status()
-                    dp_statuses = []
-                    for dp in status["dp_details"]:
-                        dp_statuses.append(
-                            {
-                                "worker_id": config.worker_id,
-                                "dp_id": dp["dp_id"],
-                                "port": config.base_port + dp["dp_id"],
-                                "queue_depth": dp["queue_depth"],
-                                "queue_tokens": dp["queue_tokens"],
-                                "batch_size": dp["batch_size"],
-                                "batch_tokens": dp["batch_tokens"],
-                                "compute_time": dp["compute_time"],
-                                "busy": status["busy"],
-                                "iteration": status["iteration"],
-                            }
-                        )
-
-                    worker_status = {
+            try:
+                status = scheduler.get_detailed_status()
+                dp_statuses = [
+                    {
                         "worker_id": config.worker_id,
-                        "base_port": config.base_port,
+                        "dp_id": dp["dp_id"],
+                        "port": config.base_port + dp["dp_id"],
+                        "queue_depth": dp["queue_depth"],
+                        "queue_tokens": dp["queue_tokens"],
+                        "batch_size": dp["batch_size"],
+                        "batch_tokens": dp["batch_tokens"],
+                        "compute_time": dp["compute_time"],
+                        "busy": status["busy"],
                         "iteration": status["iteration"],
-                        "dp_statuses": dp_statuses,
-                        "last_update": time.time(),
                     }
-                    shared_state[f"worker_{config.worker_id}"] = worker_status
-                except Exception as e:
-                    log.debug("Failed to report status: %s", e)
-            time.sleep(0.2)  # Update 5 times per second
+                    for dp in status["dp_details"]
+                ]
+                shared_state[f"worker_{config.worker_id}"] = {
+                    "worker_id": config.worker_id,
+                    "base_port": config.base_port,
+                    "iteration": status["iteration"],
+                    "dp_statuses": dp_statuses,
+                    "last_update": time.time(),
+                }
+            except Exception as e:
+                logging.getLogger(__name__).debug("Failed to report status: %s", e)
+            time.sleep(0.2)
 
-    # Start status reporting thread
-    status_thread = threading.Thread(target=report_status, daemon=True, name="status-reporter")
-    status_thread.start()
+    threading.Thread(target=report_status, daemon=True, name="status-reporter").start()
 
-    # Keep worker alive
     try:
         for t in threads:
             t.join()
@@ -196,14 +216,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Create shared state manager
     manager = Manager()
     shared_state = manager.dict()
+    log_queue = manager.Queue(maxsize=2000)
 
-    # Build worker configurations
-    worker_configs = []
-    for w in range(args.n_workers):
-        config = WorkerConfig(
+    worker_configs = [
+        WorkerConfig(
             worker_id=w,
             n_dp=args.dp_per_worker,
             base_port=args.base_port + w * args.port_step,
@@ -213,7 +231,8 @@ def main() -> None:
             max_batch=args.max_batch,
             max_seq_len=args.max_seq_len,
         )
-        worker_configs.append(config)
+        for w in range(args.n_workers)
+    ]
 
     log.info(
         "Starting swarm with %d workers, %d DP each, ports %d-%d",
@@ -223,12 +242,12 @@ def main() -> None:
         args.base_port + args.n_workers * args.port_step - 1,
     )
 
-    # Start worker processes
     processes: List[multiprocessing.Process] = []
     for config in worker_configs:
         p = multiprocessing.Process(
             target=run_worker,
-            args=(config, shared_state),
+            # Pass the Manager proxy objects directly — they are picklable
+            args=(config, shared_state, log_queue),
             name=f"prefill-worker-{config.worker_id}",
             daemon=True,
         )
@@ -236,7 +255,7 @@ def main() -> None:
         processes.append(p)
         log.info("Started worker %d (PID: %d)", config.worker_id, p.pid)
 
-    # Start TUI dashboard
+    # ── TUI dashboard ─────────────────────────────────────────────────────────
     dashboard: Optional[SwarmDashboard] = None
     enable_tui = args.tui
     if not enable_tui and not args.no_tui and RICH_AVAILABLE:
@@ -250,41 +269,18 @@ def main() -> None:
                 base_port=args.base_port,
                 port_step=args.port_step,
                 refresh_rate=args.tui_refresh,
-                shared_state=dict(shared_state),  # Convert to regular dict for access
+                shared_state=shared_state,   # ← pass the live Manager proxy, NOT dict(...)
+                log_queue=log_queue,          # ← pass the live Manager.Queue proxy
             )
             dashboard.start()
         except Exception as e:
             log.warning("Failed to start TUI dashboard: %s", e)
             import traceback
-
             traceback.print_exc()
             dashboard = None
 
-    # Wait for workers or interrupt
-    def signal_handler(sig, frame):
-        log.info("Received signal %d, shutting down swarm...", sig)
-        if dashboard:
-            dashboard.stop()
-        for p in processes:
-            p.terminate()
-        manager.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    try:
-        while True:
-            # Update dashboard's reference to shared state (it's a proxy)
-            if dashboard and hasattr(dashboard, "shared_state"):
-                dashboard.shared_state = dict(shared_state)
-
-            # Check if any worker died
-            for i, p in enumerate(processes):
-                if not p.is_alive():
-                    log.error("Worker %d (PID: %d) died unexpectedly!", i, p.pid)
-            time.sleep(1)
-    except KeyboardInterrupt:
+    # ── signal handling ───────────────────────────────────────────────────────
+    def shutdown(sig=None, frame=None):
         log.info("Shutting down swarm...")
         if dashboard:
             dashboard.stop()
@@ -292,9 +288,24 @@ def main() -> None:
             p.terminate()
             p.join(timeout=5)
         manager.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    # ── main loop: only monitors worker health ────────────────────────────────
+    # No longer patches dashboard.shared_state — the proxy stays live on its own.
+    try:
+        while True:
+            for i, p in enumerate(processes):
+                if not p.is_alive():
+                    log.error("Worker %d (PID: %d) died unexpectedly!", i, p.pid)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        shutdown()
 
 
 if __name__ == "__main__":
-    # Required for multiprocessing on macOS
+    # Required for multiprocessing on macOS / some Linux configs
     multiprocessing.set_start_method("spawn", force=True)
     main()

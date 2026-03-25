@@ -121,6 +121,9 @@ def prefill_duration(seq_lens: List[int], cfg: PrefillComputeConfig) -> float:
 
 _VOCAB = string.ascii_letters + string.digits + "  "
 
+# Typical vocabulary size for large LLMs (DeepSeek V3 uses ~100K tokens)
+_VOCAB_SIZE = 100000
+
 
 def _random_tokens(n: int) -> str:
     """Generate a random string resembling tokenised output."""
@@ -135,6 +138,103 @@ def _random_tokens(n: int) -> str:
 def _count_prompt_tokens(prompt: str) -> int:
     """Rough whitespace tokenisation (good enough for simulation)."""
     return max(1, len(prompt.split()))
+
+
+# ── KV transfer helpers ───────────────────────────────────────────────────────
+
+# KV cache block size in tokens (matches vLLM default)
+_BLOCK_SIZE = 128
+
+
+def _calc_num_blocks(prompt_tokens: int) -> int:
+    """Number of KV cache blocks needed for prompt_tokens."""
+    return max(1, (prompt_tokens + _BLOCK_SIZE - 1) // _BLOCK_SIZE)
+
+
+def _alloc_block_ids(num_blocks: int) -> List[int]:
+    """
+    Simulate KV cache block allocation.
+    Returns a list of num_blocks distinct block IDs drawn from a plausible
+    pool (1..4095), mirroring real vLLM block allocator behaviour where
+    block 0 is reserved and IDs are not necessarily contiguous.
+    """
+    pool_size = 4096
+    start = random.randint(1, pool_size - num_blocks)
+    # Simulate slight fragmentation: mostly contiguous with occasional gaps
+    ids = []
+    cursor = start
+    for _ in range(num_blocks):
+        ids.append(cursor)
+        cursor += random.choice([1, 1, 1, 2])  # 75% contiguous, 25% skip one
+    return ids
+
+
+def _make_engine_id(n_dp: int, dp_id: int) -> str:
+    """
+    Generate a stable engine ID that matches the real vLLM format:
+        "{n_dp}-{hex32}_dp{dp_id}"
+    e.g. "8-1f6fdee284a3426d84eb25b4ebdda6fe_dp0"
+    The hex part is a fixed random value per process (stable across requests).
+    """
+    return _ENGINE_HEX_PART.format(n_dp=n_dp, dp_id=dp_id)
+
+
+# Module-level stable hex part, generated once per process.
+_ENGINE_HEX_RAW = uuid.uuid4().hex + uuid.uuid4().hex[:0]  # 32 hex chars
+_ENGINE_HEX_PART = "{{n_dp}}-{hex}_dp{{dp_id}}".format(hex=_ENGINE_HEX_RAW)
+
+
+def _build_kv_transfer_params(
+    req_host: str,
+    n_dp: int,
+    dp_id: int,
+    prompt_tokens: int,
+    last_token_id: int,
+) -> dict:
+    """
+    Build the kv_transfer_params block returned in the Prefill response.
+
+    Direction flip vs. the request:
+      request:  do_remote_decode=True,  do_remote_prefill=False
+      response: do_remote_prefill=True, do_remote_decode=False
+
+    Fields derived from the real capture:
+      remote_block_ids              — allocated KV cache blocks
+      remote_engine_id              — "{n_dp}-{hex32}_dp{dp_id}"
+      remote_host                   — this server's host
+      remote_port                   — ephemeral port (simulated)
+      remote_pcp_size               — # prompt-cache pages  (= num_blocks)
+      remote_dcp_size               — # decode-cache pages  (= num_blocks)
+      last_token_id                 — vocab ID of the last prefilled token
+      remote_multi_nodes_meta_mapping — one entry per block
+      num_prompt_blocks             — total allocated blocks
+    """
+    num_blocks = _calc_num_blocks(prompt_tokens)
+    block_ids = _alloc_block_ids(num_blocks)
+    engine_id = _make_engine_id(n_dp, dp_id)
+
+    # Ephemeral port: real vLLM uses a random high port for KV-transfer RDMA/TCP
+    remote_port = random.randint(40000, 65535)
+
+    # One meta entry per block – all on this node (single-node simulation)
+    meta_mapping = {
+        str(i): {"host": req_host, "engine_id": engine_id}
+        for i in range(num_blocks)
+    }
+
+    return {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_block_ids": block_ids,
+        "remote_engine_id": engine_id,
+        "remote_host": req_host,
+        "remote_port": remote_port,
+        "remote_pcp_size": num_blocks,
+        "remote_dcp_size": num_blocks,
+        "last_token_id": last_token_id,
+        "remote_multi_nodes_meta_mapping": meta_mapping,
+        "num_prompt_blocks": num_blocks,
+    }
 
 
 # ── pending request ───────────────────────────────────────────────────────────
@@ -393,28 +493,15 @@ class EPGroupScheduler:
 
     def _build_result(self, req: PendingRequest, finish_time: float) -> dict:
         elapsed = finish_time - req.arrived_at
-        out_text = _random_tokens(req.max_tokens)
+        # last_token_id: random vocab ID for the single prefill-output token
+        last_token_id = random.randint(0, _VOCAB_SIZE - 1)
         return {
-            "id": f"cmpl-{req.req_id}",
-            "object": "text_completion",
-            "created": int(time.time()),
-            "model": "prefill-simulator",
-            "choices": [
-                {
-                    "text": out_text,
-                    "index": 0,
-                    "finish_reason": "length",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": req.prompt_tokens,
-                "completion_tokens": req.max_tokens,
-                "total_tokens": req.prompt_tokens + req.max_tokens,
-            },
-            "_sim": {
-                "dp_id": req.dp_id,
-                "prefill_time_s": round(elapsed, 6),
-            },
+            "req_id": req.req_id,
+            "prompt_tokens": req.prompt_tokens,
+            "max_tokens": req.max_tokens,
+            "dp_id": req.dp_id,
+            "prefill_time_s": round(elapsed, 6),
+            "last_token_id": last_token_id,
         }
 
     def _complete_request(
@@ -425,15 +512,143 @@ class EPGroupScheduler:
     ) -> None:
         """Called under self._lock. Signals the waiting coroutine."""
         if error:
-            result = {"error": error, "id": req.req_id}
+            result = {"error": error, "req_id": req.req_id}
         if self._loop is not None:
             req.complete(result, self._loop)
+
+
+# ── response builders ─────────────────────────────────────────────────────────
+
+
+def _build_chat_response(
+    sim: dict,
+    request_id: str,
+    model: str,
+    server_host: str,
+    n_dp: int,
+) -> dict:
+    """
+    Build a chat.completion response that exactly mirrors the real Prefill
+    node output format, including all null fields vLLM emits.
+
+    The scheduler returns only the minimal sim dict; everything else is
+    assembled here so the scheduler stays model-agnostic.
+    """
+    req_id = sim["req_id"]
+    prompt_tokens = sim["prompt_tokens"]
+    max_tokens = sim["max_tokens"]
+    dp_id = sim["dp_id"]
+    last_token_id = sim["last_token_id"]
+
+    # The single output token: one random ASCII character (mimics max_tokens=1)
+    out_char = random.choice(string.ascii_letters)
+
+    kv_params = _build_kv_transfer_params(
+        req_host=server_host,
+        n_dp=n_dp,
+        dp_id=dp_id,
+        prompt_tokens=prompt_tokens,
+        last_token_id=last_token_id,
+    )
+
+    return {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": out_char,
+                    "refusal": None,
+                    "annotations": None,
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [],
+                    "reasoning": None,
+                    "reasoning_content": None,
+                },
+                "logprobs": None,
+                "finish_reason": "length",
+                "stop_reason": None,
+                "token_ids": None,
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": max_tokens,
+            "total_tokens": prompt_tokens + max_tokens,
+            "prompt_tokens_details": None,
+        },
+        "prompt_logprobs": None,
+        "prompt_token_ids": None,
+        "kv_transfer_params": kv_params,
+    }
+
+
+def _build_completions_response(
+    sim: dict,
+    request_id: str,
+    model: str,
+    server_host: str,
+    n_dp: int,
+) -> dict:
+    """
+    Build a text completion response with the same kv_transfer_params structure.
+    """
+    req_id = sim["req_id"]
+    prompt_tokens = sim["prompt_tokens"]
+    max_tokens = sim["max_tokens"]
+    dp_id = sim["dp_id"]
+    last_token_id = sim["last_token_id"]
+
+    out_char = random.choice(string.ascii_letters)
+
+    kv_params = _build_kv_transfer_params(
+        req_host=server_host,
+        n_dp=n_dp,
+        dp_id=dp_id,
+        prompt_tokens=prompt_tokens,
+        last_token_id=last_token_id,
+    )
+
+    return {
+        "id": f"cmpl-{request_id}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": out_char,
+                "logprobs": None,
+                "finish_reason": "length",
+                "stop_reason": None,
+                "token_ids": None,
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": max_tokens,
+            "total_tokens": prompt_tokens + max_tokens,
+            "prompt_tokens_details": None,
+        },
+        "prompt_logprobs": None,
+        "prompt_token_ids": None,
+        "kv_transfer_params": kv_params,
+    }
 
 
 # ── FastAPI app factory ───────────────────────────────────────────────────────
 
 
-def make_app(dp_id: int, scheduler: EPGroupScheduler) -> FastAPI:
+def make_app(dp_id: int, scheduler: EPGroupScheduler, server_host: str="0.0.0.0", model: str="deepseek_v3") -> FastAPI:
     """
     Create a FastAPI app for a single DP port.
     All apps share the same EPGroupScheduler instance.
@@ -459,37 +674,37 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler) -> FastAPI:
         body = await request.json()
 
         prompt = body.get("prompt", "hello")
-        max_tokens = body.get("max_tokens", 16)
+        max_tokens = int(body.get("max_tokens", 1))
         kv_transfer_params = body.get("kv_transfer_params")
+
+        # Use X-Request-Id header if present, otherwise generate one
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
 
         prompt_toks = _count_prompt_tokens(prompt)
         req = PendingRequest(
-            req_id=str(uuid.uuid4()),
+            req_id=request_id,
             dp_id=dp_id,
             prompt_tokens=prompt_toks,
             max_tokens=max_tokens,
         )
         scheduler.enqueue(dp_id, req, loop)
-        result = await req.wait()
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"])
+        sim = await req.wait()
+        if "error" in sim:
+            raise HTTPException(status_code=400, detail=sim["error"])
 
         # Log aborted requests if present
-        if kv_transfer_params and kv_transfer_params.get("aborted_request"):
-            log.info(f"Received aborted requests: {kv_transfer_params['aborted_request']}")
-        if kv_transfer_params and kv_transfer_params.get("absorted_request"):
-            log.info(f"Received aborted requests (typo variant): {kv_transfer_params['absorted_request']}")
+        if kv_transfer_params:
+            for key in ("aborted_request", "absorted_request"):
+                if kv_transfer_params.get(key):
+                    log.info("Received aborted requests (%s): %s", key, kv_transfer_params[key])
 
-        # Generate mock KV transfer parameters for router compatibility
-        num_blocks = max(1, (prompt_toks + max_tokens + 127) // 128)
-        result["kv_transfer_params"] = {
-            "do_remote_decode": True,
-            "do_remote_prefill": False,
-            "remote_engine_id": req.req_id,
-            "remote_block_ids": list(range(num_blocks)),
-            "remote_host": None,
-            "remote_port": None,
-        }
+        result = _build_completions_response(
+            sim=sim,
+            request_id=request_id,
+            model=model,
+            server_host=server_host,
+            n_dp=scheduler.n_dp,
+        )
         return JSONResponse(content=result)
 
     @app.post("/v1/chat/completions")
@@ -498,59 +713,43 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler) -> FastAPI:
         body = await request.json()
 
         messages = body.get("messages", [])
-        max_tokens = body.get("max_tokens", 16)
+        max_tokens = int(body.get("max_tokens", 1))
         kv_transfer_params = body.get("kv_transfer_params")
 
+        # Use X-Request-Id header if present, otherwise generate one
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+
         # join all message contents to estimate prompt length
-        full_prompt = " ".join(m.get("content", "") for m in messages if isinstance(m, dict) and "content" in m)
+        full_prompt = " ".join(
+            m.get("content", "") for m in messages if isinstance(m, dict) and "content" in m
+        )
         prompt_toks = _count_prompt_tokens(full_prompt)
+
         req = PendingRequest(
-            req_id=str(uuid.uuid4()),
+            req_id=request_id,
             dp_id=dp_id,
             prompt_tokens=prompt_toks,
             max_tokens=max_tokens,
         )
         scheduler.enqueue(dp_id, req, loop)
-        result = await req.wait()
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"])
+        sim = await req.wait()
+        if "error" in sim:
+            raise HTTPException(status_code=400, detail=sim["error"])
 
         # Log aborted requests if present
-        if kv_transfer_params and kv_transfer_params.get("aborted_request"):
-            log.info(f"Received aborted requests: {kv_transfer_params['aborted_request']}")
-        if kv_transfer_params and kv_transfer_params.get("absorted_request"):
-            log.info(f"Received aborted requests (typo variant): {kv_transfer_params['absorted_request']}")
+        if kv_transfer_params:
+            for key in ("aborted_request", "absorted_request"):
+                if kv_transfer_params.get(key):
+                    log.info("Received aborted requests (%s): %s", key, kv_transfer_params[key])
 
-        # Generate mock KV transfer parameters for router compatibility
-        # The router expects these parameters to continue decoding on a separate decoder instance
-        num_blocks = max(1, (prompt_toks + max_tokens + 127) // 128)  # Simulate block allocation
-        kv_transfer_response = {
-            "do_remote_decode": True,
-            "do_remote_prefill": False,
-            "remote_engine_id": req.req_id,
-            "remote_block_ids": list(range(num_blocks)),
-            "remote_host": None,  # Router will fill this in
-            "remote_port": None,  # Router will fill this in
-        }
-
-        # wrap into chat completions format
-        chat_result = {
-            "id": result["id"].replace("cmpl-", "chatcmpl-"),
-            "object": "chat.completion",
-            "created": result["created"],
-            "model": result["model"],
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": result["choices"][0]["text"]},
-                    "finish_reason": "length",
-                }
-            ],
-            "usage": result["usage"],
-            "kv_transfer_params": kv_transfer_response,
-            "_sim": result["_sim"],
-        }
-        return JSONResponse(content=chat_result)
+        result = _build_chat_response(
+            sim=sim,
+            request_id=request_id,
+            model=model,
+            server_host=server_host,
+            n_dp=scheduler.n_dp,
+        )
+        return JSONResponse(content=result)
 
     @app.get("/health")
     async def health():
@@ -572,6 +771,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-dp", type=int, default=2, help="Number of DP workers")
     p.add_argument("--base-port", type=int, default=8100, help="First DP port (DP-i uses base+i)")
     p.add_argument("--host", type=str, default="0.0.0.0")
+    p.add_argument("--server-host", type=str, default=None, help="Host address reported in kv_transfer_params (defaults to --host or auto-detected)")
+    p.add_argument("--model", type=str, default="deepseek_v3", help="Model name returned in responses")
     p.add_argument("--alpha", type=float, default=30 / 100, help="Attention quadratic coeff [s/tok²]")
     p.add_argument("--beta", type=float, default=5 / 100, help="MoE linear coeff [s/tok]")
     p.add_argument("--max-batch", type=int, default=32, help="Max requests per DP per iteration")
@@ -583,9 +784,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _detect_host() -> str:
+    """Best-effort local IP detection for use in kv_transfer_params."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 def main() -> None:
     args = parse_args()
     logging.getLogger().setLevel(args.log_level.upper())
+
+    # Resolve the host address to embed in kv_transfer_params
+    if args.server_host:
+        server_host = args.server_host
+    elif args.host not in ("0.0.0.0", ""):
+        server_host = args.host
+    else:
+        server_host = _detect_host()
+
+    log.info("kv_transfer_params.remote_host will be reported as: %s", server_host)
 
     cfg = PrefillComputeConfig(
         alpha=args.alpha,
@@ -596,7 +818,10 @@ def main() -> None:
     scheduler = EPGroupScheduler(n_dp=args.n_dp, cfg=cfg)
 
     # build one FastAPI app per DP
-    apps = [make_app(dp_id=i, scheduler=scheduler) for i in range(args.n_dp)]
+    apps = [
+        make_app(dp_id=i, scheduler=scheduler, server_host=server_host, model=args.model)
+        for i in range(args.n_dp)
+    ]
 
     log.info(
         "Starting %d DP servers on ports %d-%d",
