@@ -156,6 +156,11 @@ def run_worker(config: WorkerConfig, shared_state, log_queue) -> None:
 
     # ── status reporting thread ───────────────────────────────────────────────
     def report_status():
+        # Root cause: Manager.dict() operations are synchronized via IPC, but
+        # constructing a large dict and assigning it to a key is not atomic across
+        # the entire operation. Fix: use a version counter for consistency checking,
+        # and construct the entire payload before the single assignment.
+        update_version = 0
         while True:
             try:
                 status = scheduler.get_detailed_status()
@@ -174,13 +179,18 @@ def run_worker(config: WorkerConfig, shared_state, log_queue) -> None:
                     }
                     for dp in status["dp_details"]
                 ]
-                shared_state[f"worker_{config.worker_id}"] = {
+                # Construct the entire payload first, then do a single atomic assignment
+                payload = {
                     "worker_id": config.worker_id,
                     "base_port": config.base_port,
                     "iteration": status["iteration"],
                     "dp_statuses": dp_statuses,
                     "last_update": time.time(),
+                    "version": update_version,  # monotonically increasing version for consistency
                 }
+                update_version += 1
+                # Single atomic write to Manager.dict key
+                shared_state[f"worker_{config.worker_id}"] = payload
             except Exception as e:
                 logging.getLogger(__name__).debug("Failed to report status: %s", e)
             time.sleep(0.2)

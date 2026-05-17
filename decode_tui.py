@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from typing import List, Optional
 
 from rich.align import Align
@@ -41,8 +42,9 @@ class _LogCapture(logging.Handler):
 
     def __init__(self, max_lines: int = 300) -> None:
         super().__init__()
-        self._lines: List[str] = []
-        self._max = max_lines
+        # Root cause: list.pop(0) is O(n) operation, inefficient for ring buffer
+        # Fix: Use deque(maxlen=max_lines) for O(1) append and automatic size management
+        self._lines: deque = deque(maxlen=max_lines)
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -50,14 +52,13 @@ class _LogCapture(logging.Handler):
             line = self.format(record)
             with self._lock:
                 self._lines.append(line)
-                if len(self._lines) > self._max:
-                    self._lines.pop(0)
+                # deque with maxlen automatically drops oldest when full - no manual pop needed
         except Exception:
             self.handleError(record)
 
     def snapshot(self, n: int = 40) -> List[str]:
         with self._lock:
-            return self._lines[-n:] if len(self._lines) > n else list(self._lines)
+            return list(self._lines)[-n:] if len(self._lines) > n else list(self._lines)
 
 
 # ── dashboard ─────────────────────────────────────────────────────────────────

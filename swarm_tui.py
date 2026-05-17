@@ -17,8 +17,10 @@ Layout:
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
@@ -94,8 +96,9 @@ class SwarmLogHandler(logging.Handler):
 
     def __init__(self, max_logs: int = 200) -> None:
         super().__init__()
-        self._logs: List[str] = []
-        self.max_logs = max_logs
+        # Use deque with maxlen for O(1) append and automatic size limit
+        # Root cause: list.pop(0) is O(n) operation; deque.popleft() is O(1)
+        self._logs: deque = deque(maxlen=max_logs)
         self._lock = threading.Lock()
 
     # ── called from any thread that holds a Python logging.Logger ────────────
@@ -113,16 +116,14 @@ class SwarmLogHandler(logging.Handler):
 
     def _append(self, text: str) -> None:
         with self._lock:
-            self._logs.append(text)
-            if len(self._logs) > self.max_logs:
-                self._logs.pop(0)
+            self._logs.append(text)  # deque maxlen handles overflow automatically
 
     # ── called from the render thread (read-only) ─────────────────────────────
 
     def snapshot(self, count: int = 50) -> List[str]:
         """Return a thread-safe snapshot of the last `count` log lines."""
         with self._lock:
-            tail = self._logs[-count:] if len(self._logs) > count else self._logs[:]
+            tail = list(self._logs)[-count:] if len(self._logs) > count else list(self._logs)
         return tail
 
 
@@ -174,14 +175,30 @@ class SwarmDashboard:
     # ── shared-state helpers ──────────────────────────────────────────────────
 
     def _get_worker_status(self, worker_id: int) -> WorkerStatus:
-        """Read live worker status from the Manager proxy."""
+        """Read live worker status from the Manager proxy.
+
+        Root cause: Manager.dict() single-key read is atomic via IPC proxy,
+        but the returned dict may be from a stale update. The version field
+        helps detect inconsistencies but is informational only for now.
+        """
         key = f"worker_{worker_id}"
         try:
             if self._shared_state is not None and key in self._shared_state:
+                # Single atomic read from Manager.dict proxy
                 data = self._shared_state[key]
-                return WorkerStatus.from_dict(data)
-        except Exception:
+                # Validate the payload has expected fields
+                if "worker_id" in data and "dp_statuses" in data:
+                    return WorkerStatus.from_dict(data)
+                else:
+                    logging.getLogger("prefill_swarm").debug("Incomplete status payload for worker %d", worker_id)
+        except KeyError:
+            # Worker key not yet created - normal during startup
             pass
+        except (ConnectionError, EOFError):
+            # Manager connection issue - return empty status
+            logging.getLogger("prefill_swarm").debug("Manager connection error for worker %d", worker_id)
+        except Exception as e:
+            logging.getLogger("prefill_swarm").debug("Unexpected error reading worker %d status: %s", worker_id, e)
 
         # Fallback: empty status while worker is still starting up
         dp_statuses = [
@@ -325,9 +342,15 @@ class SwarmDashboard:
                 # when self._running is set to False.
                 entry = self._log_queue.get(timeout=0.1)
                 self._log_handler.append_raw(entry)
-            except Exception:
-                # Empty (queue.Empty / EOFError on manager shutdown) — just loop
+            except queue.Empty:
+                # Normal case: no logs available, just continue looping
                 pass
+            except (EOFError, ConnectionError):
+                # Manager shutdown or connection issue - exit gracefully
+                break
+            except Exception as e:
+                # Log unexpected errors but don't crash the drain thread
+                logging.getLogger("prefill_swarm").debug("Unexpected error in log drain: %s", e)
 
     def _run_loop(self) -> None:
         """Main TUI render loop."""

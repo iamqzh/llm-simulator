@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 from rich.align import Align
@@ -30,8 +31,9 @@ class TUILogHandler(logging.Handler):
 
     def __init__(self, max_logs: int = 100):
         super().__init__()
-        self.logs: list[str] = []
-        self.max_logs = max_logs
+        # Use deque with maxlen for O(1) append and automatic size limit
+        # Root cause: list.pop(0) is O(n) operation; deque.popleft() is O(1)
+        self.logs: deque[str] = deque(maxlen=max_logs)
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -39,16 +41,15 @@ class TUILogHandler(logging.Handler):
         try:
             log_entry = self.format(record)
             with self._lock:
-                self.logs.append(log_entry)
-                if len(self.logs) > self.max_logs:
-                    self.logs.pop(0)
+                self.logs.append(log_entry)  # deque maxlen handles overflow automatically
         except Exception:
             self.handleError(record)
 
     def get_logs(self, count: int = 50) -> list[str]:
         """Get the last N log entries."""
         with self._lock:
-            return self.logs[-count:] if count < len(self.logs) else self.logs.copy()
+            # Return as list for compatibility with downstream consumers
+            return list(self.logs)[-count:] if count < len(self.logs) else list(self.logs)
 
 
 class PrefillDashboard:

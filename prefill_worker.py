@@ -70,6 +70,7 @@ import logging
 import random
 import string
 import sys
+import threading
 import time
 import uuid
 from collections import deque
@@ -180,7 +181,9 @@ def _make_engine_id(n_dp: int, dp_id: int) -> str:
 
 
 # Module-level stable hex part, generated once per process.
-_ENGINE_HEX_RAW = uuid.uuid4().hex + uuid.uuid4().hex[:0]  # 32 hex chars
+# Root cause: uuid.uuid4().hex[:0] returns empty string (slice from 0 to 0), making code confusing
+# Fix: uuid.uuid4().hex already returns exactly 32 hex characters, no need for concatenation
+_ENGINE_HEX_RAW = uuid.uuid4().hex  # 32 hex chars (e.g., "1f6fdee284a3426d84eb25b4ebdda6fe")
 _ENGINE_HEX_PART = "{{n_dp}}-{hex}_dp{{dp_id}}".format(hex=_ENGINE_HEX_RAW)
 
 
@@ -250,18 +253,28 @@ class PendingRequest:
 
     # filled when the iteration completes
     result: Optional[dict] = field(default=None, repr=False)
-    _event: asyncio.Event = field(default=None, repr=False)
+    # Root cause: _event: asyncio.Event = field(default=None) is incorrect type annotation
+    # None is not an asyncio.Event. Fix: Use Optional[asyncio.Event]
+    _event: Optional[asyncio.Event] = field(default=None, repr=False)
 
     def set_event(self, loop: asyncio.AbstractEventLoop) -> None:
         """Must be called from within the target event loop."""
         self._event = asyncio.Event()
 
     async def wait(self) -> dict:
+        # Root cause: _event could be None if set_event() was never called
+        # This prevents AttributeError when accessing uninitialized _event
+        if self._event is None:
+            raise RuntimeError("Event not initialized - set_event() must be called before wait()")
         await self._event.wait()
         return self.result
 
     def complete(self, result: dict, loop: asyncio.AbstractEventLoop) -> None:
         self.result = result
+        if self._event is None:
+            # Edge case: complete() called before set_event()
+            log.warning("complete() called on request %s before event was initialized", self.req_id[:8])
+            return
         loop.call_soon_threadsafe(self._event.set)
 
 
@@ -283,7 +296,9 @@ class EPGroupScheduler:
 
         # per-DP waiting queues
         self._queues: List[Deque[PendingRequest]] = [deque() for _ in range(n_dp)]
-        self._lock = __import__("threading").Lock()
+        # Root cause: __import__("threading") inside class is unusual and harder to read
+        # Fix: Use normal module-level threading import added above
+        self._lock = threading.Lock()
 
         # group state
         self._busy = False
@@ -291,14 +306,12 @@ class EPGroupScheduler:
         self._active_batches: List[List[PendingRequest]] = [[] for _ in range(n_dp)]
 
         # wakeup: scheduler thread sleeps until a request arrives
-        self._has_work = __import__("threading").Event()
+        self._has_work = threading.Event()
 
         # reference to the running asyncio event loop (set on first enqueue)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # start scheduler thread
-        import threading
-
         t = threading.Thread(target=self._scheduler_loop, daemon=True, name="ep-scheduler")
         t.start()
         log.info(
@@ -389,11 +402,17 @@ class EPGroupScheduler:
         while True:
             # wait until at least one request arrives
             self._has_work.wait()
-            self._has_work.clear()
+
+            # Root cause: Race condition - clearing event immediately after wait()
+            # can miss requests that arrived between wait() and clear().
+            # Fix: Only clear event AFTER confirming queues are empty.
+            # The inner loop will re-signal if work remains after each iteration.
 
             while True:
                 batches = self._try_form_batches()
                 if not batches:
+                    # Only clear event when truly idle - safe to sleep now
+                    self._has_work.clear()
                     break  # all queues empty → go back to sleep
 
                 self._run_iteration(batches)
@@ -402,47 +421,68 @@ class EPGroupScheduler:
         """
         Snapshot all queues and pack a sub-batch for each DP.
         Returns None if every queue is empty.
+
+        Root cause: Original implementation held lock during entire batch formation,
+        blocking all enqueue operations. Fix: minimize lock scope - only hold lock
+        when reading/writing shared state, not during batch packing logic.
         """
+        # Phase 1: Quick snapshot of all queues (minimal lock time)
         with self._lock:
             # check if any queue has work
             if not any(self._queues):
                 return None
+            # Snapshot each queue as a list (deque is faster for pop but list is OK for iteration)
+            queue_snapshots: List[List[PendingRequest]] = [list(q) for q in self._queues]
 
-            batches: List[List[PendingRequest]] = []
-            for dp_id, q in enumerate(self._queues):
-                batch: List[PendingRequest] = []
-                leftover: Deque[PendingRequest] = deque()
-                batch_tokens = 0  # Track cumulative tokens in the batch
-                for req in q:
-                    # Check if single request exceeds max_seq_len
-                    if req.prompt_tokens > self.cfg.max_seq_len:
-                        log.warning(
-                            "[DP %d] DROP req=%s prompt_tokens=%d > max_seq_len=%d",
-                            dp_id,
-                            req.req_id[:8],
-                            req.prompt_tokens,
-                            self.cfg.max_seq_len,
-                        )
-                        # complete with an error result immediately
-                        self._complete_request(req, error="prompt exceeds max_seq_len")
-                        continue
-                    # Check if batch size limit reached
-                    if len(batch) >= self.cfg.max_batch_size:
-                        leftover.append(req)
-                        continue
-                    # Check if cumulative tokens exceed max_seq_len
-                    if batch_tokens + req.prompt_tokens > self.cfg.max_seq_len:
-                        leftover.append(req)
-                        continue
-                    # Add request to batch
-                    batch.append(req)
-                    batch_tokens += req.prompt_tokens
-                self._queues[dp_id] = leftover
-                batches.append(batch)
-                self._active_batches[dp_id] = batch
+        # Phase 2: Batch formation WITHOUT lock (doesn't block enqueue)
+        batches: List[List[PendingRequest]] = []
+        leftovers: List[Deque[PendingRequest]] = []
+        requests_to_complete: List[tuple] = []  # (req, error) tuples for error requests
 
+        for dp_id, snapshot in enumerate(queue_snapshots):
+            batch: List[PendingRequest] = []
+            leftover: Deque[PendingRequest] = deque()
+            batch_tokens = 0
+            for req in snapshot:
+                # Check if single request exceeds max_seq_len
+                if req.prompt_tokens > self.cfg.max_seq_len:
+                    log.warning(
+                        "[DP %d] DROP req=%s prompt_tokens=%d > max_seq_len=%d",
+                        dp_id,
+                        req.req_id[:8],
+                        req.prompt_tokens,
+                        self.cfg.max_seq_len,
+                    )
+                    requests_to_complete.append((req, "prompt exceeds max_seq_len"))
+                    continue
+                # Check if batch size limit reached
+                if len(batch) >= self.cfg.max_batch_size:
+                    leftover.append(req)
+                    continue
+                # Check if cumulative tokens exceed max_seq_len
+                if batch_tokens + req.prompt_tokens > self.cfg.max_seq_len:
+                    leftover.append(req)
+                    continue
+                # Add request to batch
+                batch.append(req)
+                batch_tokens += req.prompt_tokens
+            batches.append(batch)
+            leftovers.append(leftover)
+
+        # Phase 3: Quick update of shared state (minimal lock time)
+        with self._lock:
+            # Update queues with leftovers (requests that didn't fit in current batch)
+            for dp_id in range(self.n_dp):
+                # Append leftover to existing queue (new requests may have arrived during Phase 2)
+                self._queues[dp_id].extendleft(reversed(leftovers[dp_id]))
+                self._active_batches[dp_id] = batches[dp_id]
             self._busy = True
-            return batches
+
+        # Phase 4: Complete error requests (outside lock, using saved loop reference)
+        for req, error in requests_to_complete:
+            self._complete_request(req, error=error)
+
+        return batches
 
     def _run_iteration(self, batches: List[List[PendingRequest]]) -> None:
         """
@@ -510,7 +550,7 @@ class EPGroupScheduler:
         result: Optional[dict] = None,
         error: Optional[str] = None,
     ) -> None:
-        """Called under self._lock. Signals the waiting coroutine."""
+        """Signals the waiting coroutine. Can be called outside of lock (uses thread-safe call_soon_threadsafe)."""
         if error:
             result = {"error": error, "req_id": req.req_id}
         if self._loop is not None:
@@ -647,6 +687,26 @@ def _build_completions_response(
 
 # ── FastAPI app factory ───────────────────────────────────────────────────────
 
+# Validation constants
+MAX_PROMPT_CHARS = 100000
+MAX_TOKENS_LIMIT = 8192
+MIN_TOKENS_LIMIT = 1
+
+
+def _validate_request_params(prompt_or_messages_len: int, max_tokens: int) -> None:
+    """
+    Helper function for validating request parameters.
+
+    Root cause: Validation code was duplicated in completions and chat_completions endpoints.
+    Fix: Extract to a single helper function to avoid code duplication.
+
+    Raises HTTPException if validation fails.
+    """
+    if prompt_or_messages_len > MAX_PROMPT_CHARS:
+        raise HTTPException(status_code=400, detail=f"Prompt exceeds maximum length ({MAX_PROMPT_CHARS} chars)")
+    if max_tokens < MIN_TOKENS_LIMIT or max_tokens > MAX_TOKENS_LIMIT:
+        raise HTTPException(status_code=400, detail=f"max_tokens must be between {MIN_TOKENS_LIMIT} and {MAX_TOKENS_LIMIT}")
+
 
 def make_app(dp_id: int, scheduler: EPGroupScheduler, server_host: str="0.0.0.0", model: str="deepseek_v3") -> FastAPI:
     """
@@ -670,12 +730,21 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler, server_host: str="0.0.0.0"
 
     @app.post("/v1/completions")
     async def completions(request: Request):
-        loop = asyncio.get_event_loop()
-        body = await request.json()
+        # Root cause: asyncio.get_event_loop() is deprecated in Python 3.10+
+        # In async context, use get_running_loop() which is thread-safe
+        loop = asyncio.get_running_loop()
+        try:
+            body = await request.json()
+        except Exception as e:
+            log.warning("Failed to parse JSON body: %s", e)
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
 
         prompt = body.get("prompt", "hello")
         max_tokens = int(body.get("max_tokens", 1))
         kv_transfer_params = body.get("kv_transfer_params")
+
+        # Use shared validation helper
+        _validate_request_params(len(prompt), max_tokens)
 
         # Use X-Request-Id header if present, otherwise generate one
         request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
@@ -709,8 +778,14 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler, server_host: str="0.0.0.0"
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        loop = asyncio.get_event_loop()
-        body = await request.json()
+        # Root cause: asyncio.get_event_loop() is deprecated in Python 3.10+
+        # In async context, use get_running_loop() which is thread-safe
+        loop = asyncio.get_running_loop()
+        try:
+            body = await request.json()
+        except Exception as e:
+            log.warning("Failed to parse JSON body: %s", e)
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
 
         messages = body.get("messages", [])
         max_tokens = int(body.get("max_tokens", 1))
@@ -723,6 +798,10 @@ def make_app(dp_id: int, scheduler: EPGroupScheduler, server_host: str="0.0.0.0"
         full_prompt = " ".join(
             m.get("content", "") for m in messages if isinstance(m, dict) and "content" in m
         )
+
+        # Use shared validation helper
+        _validate_request_params(len(full_prompt), max_tokens)
+
         prompt_toks = _count_prompt_tokens(full_prompt)
 
         req = PendingRequest(
@@ -781,7 +860,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tui", action="store_true", help="Enable TUI dashboard (requires rich)")
     p.add_argument("--no-tui", action="store_true", help="Disable TUI dashboard")
     p.add_argument("--tui-refresh", type=float, default=0.5, help="TUI refresh rate in seconds")
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Root cause: Command line arguments had no lower bound validation,
+    # allowing invalid values like --n-dp 0 or --max-batch -1
+    # Fix: Add explicit validation after parsing
+    if args.n_dp < 1:
+        p.error("--n-dp must be at least 1")
+    if args.base_port < 1 or args.base_port > 65535:
+        p.error("--base-port must be between 1 and 65535")
+    if args.max_batch < 1:
+        p.error("--max-batch must be at least 1")
+    if args.max_seq_len < 1:
+        p.error("--max-seq-len must be at least 1")
+    if args.alpha < 0:
+        p.error("--alpha must be non-negative")
+    if args.beta < 0:
+        p.error("--beta must be non-negative")
+    if args.tui_refresh <= 0:
+        p.error("--tui-refresh must be positive")
+
+    return args
 
 
 def _detect_host() -> str:
@@ -829,8 +928,6 @@ def main() -> None:
         args.base_port,
         args.base_port + args.n_dp - 1,
     )
-
-    import threading
 
     servers = []
     threads = []

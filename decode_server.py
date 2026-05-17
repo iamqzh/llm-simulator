@@ -161,6 +161,9 @@ class ActiveRequest:
     dp_id:         int
     prompt_tokens: int          # tokens from the prefill phase
     max_tokens:    int          # max NEW tokens to generate
+    # Root cause: is_overlong property accessed self.max_seq_len which was not defined
+    # Fix: Add max_seq_len as a field so the property can access it
+    max_seq_len:   int = 2048   # hard cap for sequence length
     arrived_at:    float = field(default_factory=time.monotonic)
 
     # mutable decode state
@@ -177,12 +180,16 @@ class ActiveRequest:
 
     def init_async(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
-        # maxsize=0 → unbounded; scheduler never blocks
-        self._token_queue = asyncio.Queue()
+        # Root cause: Unbounded queue (maxsize=0) allows memory exhaustion via malicious large max_tokens
+        # Fix: Set maxsize to max_tokens + 1 (tokens + sentinel None) to bound memory usage
+        self._token_queue = asyncio.Queue(maxsize=self.max_tokens + 1)
 
     def push_token(self, token: Optional[str]) -> None:
         """Called from the scheduler thread; thread-safe."""
-        assert self._loop is not None and self._token_queue is not None
+        # Root cause: assert can be disabled with -O, not suitable for runtime validation
+        # Fix: Use explicit RuntimeError for production-safe validation
+        if self._loop is None or self._token_queue is None:
+            raise RuntimeError("push_token() called before init_async()")
         self._loop.call_soon_threadsafe(self._token_queue.put_nowait, token)
 
     async def token_stream(self) -> AsyncIterator[Optional[str]]:
@@ -338,10 +345,16 @@ class DecodeScheduler:
         while True:
             # Sleep until at least one request exists anywhere
             self._has_work.wait()
-            self._has_work.clear()
+
+            # Root cause: Race condition - clearing event immediately after wait()
+            # can miss requests that arrived between wait() and clear().
+            # Fix: Only clear event AFTER confirming no work exists.
+            # The inner loop will re-signal if work remains after each step.
 
             while True:
                 if not self._any_work():
+                    # Only clear event when truly idle - safe to sleep now
+                    self._has_work.clear()
                     break
                 self._run_one_step()
 
@@ -364,6 +377,13 @@ class DecodeScheduler:
                 slots -= 1
 
     def _run_one_step(self) -> None:
+        """
+        Root cause: Original implementation held lock during entire token generation
+        phase (step 4), blocking all enqueue operations for the entire iteration.
+        Fix: Minimize lock scope - only hold lock when modifying shared state
+        (self._active, self._waiting), not during token generation/push which
+        operates on per-request asyncio queues (thread-safe via call_soon_threadsafe).
+        """
         # ── 1. admit new requests into empty slots ────────────────────────────
         with self._lock:
             self._admit_waiting()
@@ -395,32 +415,36 @@ class DecodeScheduler:
         # ── 3. simulate computation (sleep) ──────────────────────────────────
         time.sleep(group_duration)
 
-        # ── 4. generate one token per active request; handle completions ──────
+        # ── 4. generate tokens WITHOUT lock (per-request operations) ───────────
+        # Token generation and push don't need lock - they only modify per-request
+        # state (generated, current_len) and push to asyncio.Queue (thread-safe)
+        finished_requests: List[tuple] = []  # (dp_id, req) tuples for requests that completed
+        for dp_id, batch in enumerate(batches):
+            for req in batch:
+                token = _next_token()
+                req.generated += 1
+                req.current_len += 1
+
+                done = req.generated >= req.max_tokens
+                over = req.current_len >= self.cfg.max_seq_len
+
+                if done or over:
+                    reason = "length" if done else "max_seq_len"
+                    log.info(
+                        "[DP %d] DONE  req=%.8s  generated=%d  reason=%s",
+                        dp_id, req.req_id, req.generated, reason,
+                    )
+                    req.push_token(token)   # last real token
+                    req.push_token(None)    # sentinel: stream finished
+                    finished_requests.append((dp_id, req))
+                else:
+                    req.push_token(token)
+
+        # ── 5. Update shared state with minimal lock time ───────────────────────
         with self._lock:
-            for dp_id, batch in enumerate(batches):
-                finished: List[ActiveRequest] = []
-                for req in batch:
-                    token = _next_token()
-                    req.generated   += 1
-                    req.current_len += 1
-
-                    done = req.generated >= req.max_tokens
-                    over = req.current_len >= self.cfg.max_seq_len
-
-                    if done or over:
-                        reason = "length" if done else "max_seq_len"
-                        log.info(
-                            "[DP %d] DONE  req=%.8s  generated=%d  reason=%s",
-                            dp_id, req.req_id, req.generated, reason,
-                        )
-                        req.push_token(token)   # last real token
-                        req.push_token(None)    # sentinel: stream finished
-                        finished.append(req)
-                    else:
-                        req.push_token(token)
-
-                # remove finished requests from active batch
-                for req in finished:
+            # remove finished requests from active batch
+            for dp_id, req in finished_requests:
+                if req in self._active[dp_id]:
                     self._active[dp_id].remove(req)
 
                 # immediately admit next waiting requests for removed slots
@@ -523,13 +547,36 @@ def make_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        loop = asyncio.get_event_loop()
-        body = await request.json()
+        # Root cause: asyncio.get_event_loop() is deprecated in Python 3.10+
+        # In async context, use get_running_loop() which is thread-safe
+        loop = asyncio.get_running_loop()
+        try:
+            body = await request.json()
+        except Exception as e:
+            log.warning("Failed to parse JSON body: %s", e)
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
 
         messages   = body.get("messages", [])
         max_tokens = int(body.get("max_tokens", 64))
         stream     = bool(body.get("stream", True))
         kv_params  = body.get("kv_transfer_params", {})
+
+        # Root cause: Input validation missing - malicious users can send超大 requests
+        # causing memory exhaustion or unreasonable decode times
+        MAX_TOKENS_LIMIT = 8192
+        MIN_TOKENS_LIMIT = 1
+        MAX_MESSAGES_LIMIT = 100  # Prevent huge message arrays
+        MAX_MESSAGE_CONTENT_LEN = 50000  # Prevent huge single message content
+
+        if max_tokens < MIN_TOKENS_LIMIT or max_tokens > MAX_TOKENS_LIMIT:
+            raise HTTPException(status_code=400, detail=f"max_tokens must be between {MIN_TOKENS_LIMIT} and {MAX_TOKENS_LIMIT}")
+        if len(messages) > MAX_MESSAGES_LIMIT:
+            raise HTTPException(status_code=400, detail=f"Too many messages (max {MAX_MESSAGES_LIMIT})")
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > MAX_MESSAGE_CONTENT_LEN:
+                    raise HTTPException(status_code=400, detail=f"Message content too long (max {MAX_MESSAGE_CONTENT_LEN} chars)")
 
         # Use X-Request-Id header if present, otherwise generate one
         request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
@@ -550,6 +597,7 @@ def make_app(
             dp_id         = dp_id,
             prompt_tokens = prompt_tokens,
             max_tokens    = max_tokens,
+            max_seq_len   = scheduler.cfg.max_seq_len,
         )
         scheduler.enqueue(dp_id, req, loop)
 
@@ -669,7 +717,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tui",        action="store_true", help="Enable TUI dashboard")
     p.add_argument("--no-tui",     action="store_true", help="Disable TUI dashboard")
     p.add_argument("--tui-refresh",type=float, default=0.3,  help="TUI refresh interval (s)")
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Root cause: Command line arguments had no lower bound validation,
+    # allowing invalid values like --n-dp 0 or --max-batch -1
+    # Fix: Add explicit validation after parsing
+    if args.n_dp < 1:
+        p.error("--n-dp must be at least 1")
+    if args.base_port < 1 or args.base_port > 65535:
+        p.error("--base-port must be between 1 and 65535")
+    if args.max_batch < 1:
+        p.error("--max-batch must be at least 1")
+    if args.max_seq_len < 1:
+        p.error("--max-seq-len must be at least 1")
+    if args.alpha < 0:
+        p.error("--alpha must be non-negative")
+    if args.beta < 0:
+        p.error("--beta must be non-negative")
+    if args.tui_refresh <= 0:
+        p.error("--tui-refresh must be positive")
+
+    return args
 
 
 def main() -> None:
