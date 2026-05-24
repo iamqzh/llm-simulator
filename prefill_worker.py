@@ -431,8 +431,13 @@ class EPGroupScheduler:
             # check if any queue has work
             if not any(self._queues):
                 return None
-            # Snapshot each queue as a list (deque is faster for pop but list is OK for iteration)
-            queue_snapshots: List[List[PendingRequest]] = [list(q) for q in self._queues]
+            # Drain queues into snapshot — leftovers are restored to the front in Phase 3.
+            # Without clear(), snapshot items would stay in the queue and be re-picked every
+            # iteration, busy-looping the scheduler thread.
+            queue_snapshots: List[List[PendingRequest]] = []
+            for q in self._queues:
+                queue_snapshots.append(list(q))
+                q.clear()
 
         # Phase 2: Batch formation WITHOUT lock (doesn't block enqueue)
         batches: List[List[PendingRequest]] = []
